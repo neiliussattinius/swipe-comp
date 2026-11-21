@@ -401,17 +401,22 @@ const AddOnLogic = {
    * changes nothing rather than one per take. Resolves to the sources now analysed.
    */
   async analyzeTakes(session, track, missing) {
-    const original = session.playlistFor(track), done = [];
+    const done = [];
     if (!missing.length) return done;
+    // Each lane is visited on its own track (a grouped track's takes too); every track touched
+    // goes back to the playlist it was playing.
+    const originals = new Map();
     await session.transaction('Draw take waveforms', async () => {
       for (const { lane, source } of missing) {
+        const tid = lane.trackUid.value ?? track.id;
+        if (!originals.has(tid)) originals.set(tid, session.playlistFor(session.tracks.byId(tid) ?? track));
         if (!(await source.overviewInfo())) {
-          await AddOnLogic.showPlaylist(session, track.id, lane.version.value);
+          await AddOnLogic.showPlaylist(session, tid, lane.version.value);
           for (let i = 0; i < 30 && !(await source.overviewInfo()); i++) await new Promise((r) => setTimeout(r, 100));
         }
         done.push(source);
       }
-      if (original) await AddOnLogic.showPlaylist(session, track.id, original.version.value);
+      for (const [tid, original] of originals) if (original) await AddOnLogic.showPlaylist(session, tid, original.version.value);
     }, { continuous: true });
     return done;
   },
@@ -748,7 +753,7 @@ const AddOnLogic = {
     try {
       const raw = session.client.raw, at = session.path;
       const sel = JSON.parse((await raw.get(`${at}/contexts/main/selection_groups`))?.value ?? '[]');
-      const groups = await raw.get(`${at}/groups`, { levels: 3 });
+      const groups = await raw.get(`${at}/groups`, { levels: 4 });   // group, members, member, its properties
       const out = [];
       for (const g of groups?.children ?? []) {
         const uid = g.properties?.uid?.value;

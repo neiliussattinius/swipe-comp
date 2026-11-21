@@ -70,6 +70,28 @@ let groupWanted = true;  // the header's "Comp the group" box
 let groupNamesShown = [];
 const groupActive = () => groupWanted && mates.length > 0;
 
+// The group view, as in Logic: comping a group, the takes area shows this track's takes, then
+// each grouped track as a header row with its comp, followed by its takes when opened (click the
+// header to open or close it). A swipe on any track's take comps the whole group: the comp list
+// is kept in this track's take ids, and a grouped track's take stands for the take it matches.
+let opened = new Set();   // grouped tracks shown open (track ids); closed by default
+/** The rows of the takes area: { kind: 'take', track, take, lead } or { kind: 'mate', mate }. */
+function rowsOf() {
+  const rows = takes.map((take) => ({ kind: 'take', track, take, lead: take }));
+  if (!groupActive()) return rows;
+  for (const m of mates) {
+    rows.push({ kind: 'mate', mate: m });
+    if (!opened.has(m.track.id)) continue;
+    for (const lead of takes) {
+      const take = session.playlists.byId(m.map.get(lead.id));
+      if (take) rows.push({ kind: 'take', track: m.track, take, lead, mate: m });
+    }
+  }
+  return rows;
+}
+const rowIndexAt = (e) => Math.floor(localY(e, takesCanvas) / LANE_H);
+const rowAt = (e) => rowsOf()[rowIndexAt(e)];
+
 /** Mates with no matching take for a take the comp uses, as "BGV 2: no match for T5". */
 function groupGaps() {
   const used = [...new Set(segments.map((s) => s.take))];
@@ -99,7 +121,13 @@ async function refreshGroup() {
   paintGroup();
   if (!busy) setStatus(summary());
   paintNotice();
+  scheduleGather();   // the grouped tracks' rows need their takes' waveforms
+  schedulePaint();
+  // Ask for missing waveforms when the grouped tracks change (not on every refresh: each check asks LUNA per take).
+  const sig = `${forTrack.id}:${mates.map((m) => m.track.id).join(',')}`;
+  if (sig !== matesSeen && mates.length && groupWanted && !session.transport.playing.value) { matesSeen = sig; void drawMissingWaveforms(); }
 }
+let matesSeen = '';
 let groupTimer;
 function scheduleGroup() {
   clearTimeout(groupTimer);
@@ -113,7 +141,7 @@ function paintGroup() {
   label.textContent = `Comp the group (${name}: ${mates.length + 1} tracks)`;
   box.title = `Comp ${[track, ...mates.map((m) => m.track)].map((t) => t?.name.value).join(', ')} together: the same sections on each, from each track's matching take, as one undo step.`;
 }
-$('groupOn').onchange = () => { groupWanted = $('groupOn').checked; setStatus(summary()); paintNotice(); };
+$('groupOn').onchange = () => { groupWanted = $('groupOn').checked; setStatus(summary()); paintNotice(); scheduleGather(); schedulePaint(); };
 
 /** Play `lane` on this track and, comping a group, the matching take (or comp) on each mate. */
 async function playEverywhere(lane) {
@@ -238,7 +266,9 @@ async function gather() {
   const kind = Luna.kindForScale(((t.seconds(view.end) - t.seconds(view.start)) * 1e9) / w);
   const zoomGain = session.context.waveformZoom.value ?? 1;
   const lanes = new Map();
-  for (const lane of compLane ? [compLane, ...takes] : takes) {
+  // Comping a group, the grouped tracks' takes too: their header rows draw their comps from them.
+  const mateTakes = groupActive() ? mates.flatMap((m) => L.takesOf(session, m.track)) : [];
+  for (const lane of [...(compLane ? [compLane] : []), ...takes, ...mateTakes]) {
     const out = [];
     for (const piece of L.piecesOf(lane)) {
       if (piece.stop <= view.start || piece.start >= view.end) continue;
@@ -382,18 +412,34 @@ function drawGrid(ctx, lines, top, h) {
   for (const l of lines) { ctx.fillStyle = UI.grid[l.level]; ctx.fillRect(Math.round(l.x), top, 1, h); }
 }
 
-/** A row's header, as LUNA's track headers: its colour down the left edge, an audio icon, the name. */
-function label(ctx, text, top, h, playing, color) {
-  ctx.fillStyle = playing ? UI.headOn : UI.head;
+/**
+ * A row's header, as LUNA's track headers: its colour down the left edge, an audio icon (or the
+ * open/close arrow of a grouped track's header row), the name, and an optional line under it
+ * (the track's name, when several tracks' takes are showing).
+ */
+function label(ctx, text, top, h, playing, color, { sub = '', arrow, bg } = {}) {
+  ctx.fillStyle = playing ? UI.headOn : bg ?? UI.head;
   ctx.fillRect(0, top, GUTTER, h);
   ctx.fillStyle = color;
   ctx.fillRect(0, top, 6, h);
   ctx.fillStyle = playing ? '#e6e6e6' : '#9a9a9a';
-  [3, 7, 11, 6, 3].forEach((bh, i) => ctx.fillRect(13 + i * 3, top + 12 - bh / 2, 2, bh));
+  if (arrow) {
+    ctx.font = '600 15px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#e0e0e0';
+    ctx.fillText(arrow === 'open' ? '▾' : '▸', 13, top + 12.5);
+  } else {
+    [3, 7, 11, 6, 3].forEach((bh, i) => ctx.fillRect(13 + i * 3, top + 12 - bh / 2, 2, bh));
+  }
   ctx.font = '600 12px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = playing ? UI.nameOn : UI.name;
   ctx.fillText(fitText(ctx, `${playing ? '▶ ' : ''}${text}`, GUTTER - 40), 32, top + 12.5);
+  if (sub) {
+    ctx.font = '11px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
+    ctx.fillStyle = '#8f8f8f';
+    ctx.fillText(fitText(ctx, sub, GUTTER - 40), 32, top + 28.5);
+  }
   ctx.fillStyle = UI.headLine;
   ctx.fillRect(GUTTER - 1, top, 1, h);
   ctx.fillRect(0, top + h - 1, GUTTER, 1);
@@ -457,7 +503,8 @@ function paintTop(grid) {
       ? 'Drag across the parts of the take you want to keep. Or choose it in "Start from" to begin with all of it, then erase with the Silence strip.'
       : 'Drag across a take below to start the comp.', GUTTER + 12, top + h / 2);
   }
-  label(ctx, compLane?.name.value ?? L.COMP_NAME, top, h, !!compLane && session.playlistFor(track) === compLane, '#F7C449');
+  label(ctx, compLane?.name.value ?? L.COMP_NAME, top, h, !!compLane && session.playlistFor(track) === compLane, '#F7C449',
+    { sub: groupActive() ? track.name.value ?? '' : '' });
   paintSilence(ctx, list, W);
   drawMarkerLines(ctx, MARKS_H, BAR_H + COMP_H + SIL_H);
 }
@@ -576,22 +623,49 @@ function paintTidyMarks(ctx, W) {
 }
 const markAt = (px, py) => (py >= SIL_TOP && py < SIL_TOP + MARK_H + 4 ? tidyMarks().find((m) => Math.abs(m.x - px) <= 8) : undefined);
 
+/** A grouped track's header row in the takes area: its comp, drawn from its own matching takes. */
+function paintMateRow(ctx, m, top, grid, list, W) {
+  ctx.fillStyle = '#202020';
+  ctx.fillRect(GUTTER, top, W - GUTTER, LANE_H);
+  for (const s of list) {
+    const id = m.map.get(s.take);
+    if (id) drawClip(ctx, s.start, s.stop, top + 1, LANE_H - 3, clipColors(s.take), nameOf(id), scene?.lanes.get(id) ?? []);
+  }
+  drawGrid(ctx, grid, top, LANE_H - 1);
+  if (!list.length) {
+    ctx.font = '12px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#6f6f6f';
+    ctx.fillText(`${m.track.name.value}'s comp, which follows this one`, GUTTER + 12, top + LANE_H / 2);
+  }
+  ctx.fillStyle = UI.sep;
+  ctx.fillRect(GUTTER, top + LANE_H - 1, W - GUTTER, 1);
+  const n = L.recordedTakes(session, m.track).length, open = opened.has(m.track.id);
+  const tc = m.track.color?.value, color = tc && (tc >>> 24) ? L.argbCss(tc) : '#8a8a8a';
+  label(ctx, m.track.name.value ?? 'Track', top, LANE_H, !!m.lane && session.playlistFor(m.track) === m.lane, color,
+    { sub: `${m.lane ? m.lane.name.value ?? L.COMP_NAME : 'no comp yet'} · ${n} take${n === 1 ? '' : 's'}`, arrow: open ? 'open' : 'closed', bg: '#2e2e2e' });
+}
+
 function paintTakes(grid) {
-  const H = Math.max(1, takes.length * LANE_H), ctx = sizeCanvas($('takesCanvas'), H), W = widthCss();
+  const rows = session && track ? rowsOf() : [];
+  const H = Math.max(1, rows.length * LANE_H), ctx = sizeCanvas($('takesCanvas'), H), W = widthCss();
   ctx.clearRect(0, 0, W, H);
   if (!session || !track) return;
-  const list = shownSegments(), playing = session.playlistFor(track);
-  takes.forEach((take, i) => {
-    const top = i * LANE_H, pieces = scene?.lanes.get(take.id) ?? [], name = take.name.value ?? `Take ${take.version.value}`;
+  const list = shownSegments(), group = groupActive();
+  rows.forEach((row, i) => {
+    const top = i * LANE_H;
+    if (row.kind === 'mate') { paintMateRow(ctx, row.mate, top, grid, list, W); return; }
+    const { take, lead } = row, pieces = scene?.lanes.get(take.id) ?? [], name = take.name.value ?? `Take ${take.version.value}`;
     ctx.fillStyle = UI.lane;
     ctx.fillRect(GUTTER, top, W - GUTTER, LANE_H);
-    // The take's audio, greyed; the stretches the comp uses from it drawn as LUNA clips.
+    // The take's audio, greyed; the stretches the comp uses from it drawn as LUNA clips. A grouped
+    // track's take is lit where the comp uses the take it matches, in that take's colour.
     for (const p of pieces) drawClip(ctx, p.start, p.stop, top + 1, LANE_H - 3, GHOST, '', [p]);
-    const c = clipColors(take.id);
-    for (const s of list) if (s.take === take.id) drawClip(ctx, s.start, s.stop, top + 1, LANE_H - 3, c, name, pieces);
+    const c = clipColors(lead.id);
+    for (const s of list) if (s.take === lead.id) drawClip(ctx, s.start, s.stop, top + 1, LANE_H - 3, c, name, pieces);
     drawGrid(ctx, grid, top, LANE_H - 1);
     const rect = preview?.rect;
-    if (rect?.take === take.id) {
+    if (rect?.take === lead.id && (rect.track ?? track.id) === row.track.id) {
       const a = Math.max(GUTTER, x(rect.a)), b = Math.min(W, x(rect.b));
       ctx.fillStyle = rect.erase ? 'rgba(255, 90, 90, 0.18)' : 'rgba(255, 255, 255, 0.16)';
       ctx.fillRect(a, top + 1, Math.max(1, b - a), LANE_H - 3);
@@ -602,7 +676,8 @@ function paintTakes(grid) {
     }
     ctx.fillStyle = UI.sep;
     ctx.fillRect(GUTTER, top + LANE_H - 1, W - GUTTER, 1);
-    label(ctx, name, top, LANE_H, playing === take, hue(take.id));
+    label(ctx, name, top, LANE_H, session.playlistFor(row.track) === take, hue(lead.id),
+      { sub: group ? row.track.name.value ?? '' : '', bg: row.mate ? '#333333' : undefined });
   });
   drawMarkerLines(ctx, 0, H);
 }
@@ -702,14 +777,17 @@ async function nameClipsIfNeeded() {
   }
 }
 
-let analyzing = false;
+let analyzing = false, analyzeAgain = false;
 /** Have LUNA analyse any take it has no waveform for yet. Only while stopped, so nothing is heard. */
 async function drawMissingWaveforms() {
-  if (!track || busy || analyzing || session.transport.playing.value) return;
+  if (analyzing) { analyzeAgain = true; return; }   // asked again mid-run (the group came in): run once more after
+  if (!track || busy || session.transport.playing.value) return;
   analyzing = true;
   let mine = false;   // whether this call set `busy`, so it only clears its own
   try {
-    const missing = await L.unanalyzed(session, compLane ? [compLane, ...takes] : takes);
+    // Comping a group, the grouped tracks' takes and comps too (their rows draw them), in the same undo step.
+    const others = groupActive() ? mates.flatMap((m) => [...(m.lane ? [m.lane] : []), ...L.takesOf(session, m.track)]) : [];
+    const missing = await L.unanalyzed(session, [...(compLane ? [compLane] : []), ...takes, ...others]);
     if (!missing.length || busy || session.transport.playing.value) return;
     busy = mine = true;
     setStatus(`Asking LUNA for the waveforms of ${missing.length} take${missing.length === 1 ? '' : 's'}...`, 'busy');
@@ -726,6 +804,7 @@ async function drawMissingWaveforms() {
     }
     scheduleGather();
     schedulePaint();
+    if (analyzeAgain) { analyzeAgain = false; setTimeout(() => void drawMissingWaveforms(), 0); }
   }
 }
 
@@ -789,21 +868,30 @@ function endDrag() {
   else schedulePaint();
 }
 
+// On a take row `drag.take` is the take the comp list knows: this track's take, or, on a grouped
+// track's row, the take of this track it matches (`drag.track` is the row's own track).
 takesCanvas.addEventListener('pointerdown', (e) => {
   if (!track || busy || e.button !== 0) return;
-  const px = localX(e, takesCanvas), take = takes[Math.floor(localY(e, takesCanvas) / LANE_H)];
-  if (!take || px < GUTTER) return;   // clicks on a name are handled by click / dblclick below
-  const edge = !e.altKey && edgeAt(px, take.id);
+  const px = localX(e, takesCanvas), row = rowAt(e);
+  if (!row || px < GUTTER) return;   // clicks on a name are handled by click / dblclick below
+  if (row.kind === 'mate') {
+    // A grouped track's comp: its seams are the comp's seams, so they drag like the comp row's.
+    const edge = edgeAt(px);
+    if (edge) beginEdgeDrag(e, takesCanvas, edge);
+    return;
+  }
+  const edge = !e.altKey && edgeAt(px, row.lead.id);
   if (edge) { beginEdgeDrag(e, takesCanvas, edge); return; }
-  drag = { kind: 'swipe', take, x0: px, t0: tickAt(px), erase: e.altKey };
+  drag = { kind: 'swipe', take: row.lead, track: row.track, x0: px, t0: tickAt(px), erase: e.altKey };
   takesCanvas.setPointerCapture(e.pointerId);
 });
 
 takesCanvas.addEventListener('pointermove', (e) => {
   const px = localX(e, takesCanvas);
   if (!drag) {
-    const take = takes[Math.floor(localY(e, takesCanvas) / LANE_H)];
-    takesCanvas.style.cursor = track && take && px >= GUTTER && !busy && edgeAt(px, take.id) ? EDGE_CURSOR : '';
+    const row = rowAt(e);
+    const over = track && row && px >= GUTTER && !busy && (row.kind === 'mate' ? edgeAt(px) : edgeAt(px, row.lead.id));
+    takesCanvas.style.cursor = over ? EDGE_CURSOR : track && row && px < GUTTER ? 'pointer' : '';
     return;
   }
   if (drag.kind === 'edge') { moveEdgeDrag(px); return; }
@@ -812,7 +900,7 @@ takesCanvas.addEventListener('pointermove', (e) => {
   preview = range
     ? {
         list: drag.erase ? L.clearRange(current(), range[0], range[1]) : L.applySwipe(current(), drag.take.id, range[0], range[1]),
-        rect: { take: drag.take.id, a: range[0], b: range[1], erase: drag.erase },
+        rect: { take: drag.take.id, track: drag.track?.id, a: range[0], b: range[1], erase: drag.erase },
       }
     : undefined;
   schedulePaint();
@@ -841,22 +929,31 @@ takesCanvas.addEventListener('pointerup', (e) => {
 
 takesCanvas.addEventListener('pointercancel', () => { drag = undefined; preview = undefined; schedulePaint(); });
 
-// A take's name: one click plays that take alone (after a short wait, in case it is the
-// first click of a double-click); a double-click renames it.
+// A take's name: one click plays that take alone (on every grouped track, comping a group),
+// after a short wait in case it is the first click of a double-click; a double-click renames
+// it. A grouped track's header: one click opens or closes its takes; a double-click makes it the
+// track the page is on.
 let nameClickTimer;
-const takeUnder = (e) => takes[Math.floor(localY(e, takesCanvas) / LANE_H)];
 takesCanvas.addEventListener('click', (e) => {
   if (!track || localX(e, takesCanvas) >= GUTTER) return;
-  const take = takeUnder(e);
-  if (!take) return;
+  const row = rowAt(e);
+  if (!row) return;
   clearTimeout(nameClickTimer);
-  nameClickTimer = setTimeout(() => void audition(take), 250);
+  nameClickTimer = setTimeout(() => {
+    if (row.kind === 'take') { void audition(row.lead); return; }
+    const id = row.mate.track.id;
+    if (opened.has(id)) opened.delete(id); else opened.add(id);
+    scheduleGather();
+    schedulePaint();
+  }, 250);
 });
 takesCanvas.addEventListener('dblclick', (e) => {
   if (!track || localX(e, takesCanvas) >= GUTTER) return;
   clearTimeout(nameClickTimer);
-  const row = Math.floor(localY(e, takesCanvas) / LANE_H);
-  if (takes[row]) startRename(takes[row], row);
+  const i = rowIndexAt(e), row = rowsOf()[i];
+  if (!row) return;
+  if (row.kind === 'mate') { if (!busy) void bindTrack(row.mate.track.id, false); return; }
+  startRename(row.lead, i);
 });
 
 function startRename(take, row) {

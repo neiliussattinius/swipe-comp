@@ -60,6 +60,11 @@ track, take 2 another. A grouped track with a different number of takes is left 
 in the status line. An empty New Version is not counted. Clicking a take's name plays that take
 on every grouped track, and renaming a take renames its match on each one.
 
+Comping a group, the grouped tracks show below this track's takes, as in Logic: each as a
+header row with its own comp, drawn from its own recording. Click a grouped track's name to
+show or hide its takes; you can swipe on those too, and the whole group follows. Double-click
+it to make it the track you're working on.
+
 Group comping has been tested against the SDK's simulated LUNA only, not yet on a real
 recorded group. Reports welcome.
 
