@@ -1,0 +1,23 @@
+{
+  "name": "swipe_comp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Swipe Comp, a LUNA Add On built with UA's LUNA Builder SDK",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "serve": "node tools/ua-builder.mjs serve",
+    "install-addon": "node tools/ua-builder.mjs install",
+    "doctor": "node tools/ua-builder.mjs doctor",
+    "pack": "node tools/release.mjs",
+    "release": "node tools/release.mjs"
+  },
+  "devDependencies": {
+    "vite": "8.3.0",
+    "vitest": "5.0.1"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+*.zip
+*.lunaaddon
+.DS_Store
+
+# Local working notes, not published
+NEXT.md
+DEVNOTES.md
+dist/

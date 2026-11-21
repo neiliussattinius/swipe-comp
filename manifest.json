@@ -1,0 +1,15 @@
+{
+    "package_name": "Swipe Comp",
+    "id": "com.neilsattin.swipe_comp",
+    "title": "Swipe Comp",
+    "version": "0.1.0",
+    "manufacturer": "Neil Sattin",
+    "description": "See every take on a track at once and swipe across them to build a crossfaded comp, the way Logic's Quick Swipe Comping works.",
+    "categories": ["Editing"],
+    "sdk_version": "3.1.2",
+    "min_luna_version": "3.1.2",
+    "engines": ["luna"],
+    "html": "index.html",
+    "icon": "icon.png",
+    "target": "app"
+}

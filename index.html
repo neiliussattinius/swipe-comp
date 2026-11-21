@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Swipe Comp</title>
+  <style>
+    :root { color-scheme: dark; --accent: #F7C449; --bg: #1b1b1b; --panel: #2b2b2b; --line: #161616; --text: #e2e2e2; --dim: #9a9a9a; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 13px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; display: flex; flex-direction: column; overflow: hidden; user-select: none; }
+    header { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    header label { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+    header select, header input { font: inherit; background: #3a3a3a; color: var(--text); border: 1px solid #4c4c4c; border-radius: 4px; padding: 4px 8px; }
+    header input[type=number] { width: 56px; }
+    /* Every header button is a tape machine's square key, lit amber when on (Play and Solo kept
+       from a tape-look trial; the rest made to match). */
+    header button {
+      font: 600 11px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; letter-spacing: 0.06em; text-transform: uppercase;
+      border-radius: 3px; padding: 6px 12px; color: #efe6d2; cursor: pointer;
+      background: linear-gradient(#3b332a, #29231c); border: 1px solid #5a4d3c;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 2px 0 #0b0907;
+    }
+    header button:hover { border-color: #8a7458; }
+    header button:active:not(:disabled) { transform: translateY(1px); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 1px 0 #0b0907; }
+    header button#play, header button#solo { min-width: 64px; }
+    header button.on {
+      background: linear-gradient(#ffd27a, #e8a93b); color: #2a1c05; border-color: #f0b54a;
+      box-shadow: 0 0 10px rgba(232, 169, 59, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.45);
+    }
+    header button:disabled { opacity: 0.4; cursor: default; }
+    header button:disabled:hover { border-color: #5a4d3c; }
+    #status { margin-left: auto; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
+    #status.busy { color: var(--accent); }
+    #status.error { color: #ff7a7a; }
+    .stage { position: relative; }
+    .stage canvas { display: block; width: 100%; }
+    #top { border-bottom: 1px solid var(--line); background: #222; }
+    #scroller { flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0; }
+    #scroller.busy, #top.busy { cursor: progress; }
+    .playhead { position: absolute; top: 0; bottom: 0; left: 0; width: 1.5px; background: #ff5a5a; pointer-events: none; will-change: transform; }
+    footer { padding: 6px 12px; color: var(--dim); background: var(--panel); border-top: 1px solid var(--line); font-size: 12px; }
+    #empty { padding: 40px; color: var(--dim); text-align: center; display: none; }
+    #rename { position: absolute; left: 28px; height: 22px; font: 12px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: #111; color: #fff; border: 1px solid var(--accent); border-radius: 5px; padding: 0 6px; outline: none; }
+    #raise { position: absolute; left: 12px; top: 82px; height: 18px; padding: 0 7px; font: 11px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; background: transparent; color: #c9b06a; border: 1px solid #6a5a2a; border-radius: 4px; cursor: pointer; z-index: 2; }
+    #raise:hover { color: #F7C449; border-color: #F7C449; }
+    #raise[hidden] { display: none; }
+    #groupBox[hidden] { display: none; }
+    #groupBox { color: #F7C449; }
+    #notice { display: none; align-items: center; gap: 10px; padding: 6px 12px; background: #3a2f12; color: #f3d98b; border-bottom: 1px solid #5a4a1c; }
+    #notice button { font: inherit; background: #F7C449; color: #000; border: 0; border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+    #notice button.secondary { background: transparent; color: #f3d98b; border: 1px solid #8a7330; }
+    header button#tidy { color: #ffb347; border-color: #8a5a1c; }
+    header button#tidy.quiet { color: #a39782; border-color: #5a4d3c; }
+    #tidyPanel { padding: 8px 12px; background: #241d10; color: #f3d98b; border-bottom: 1px solid #5a4a1c; max-height: 40vh; overflow-y: auto; }
+    #tidyPanel[hidden] { display: none; }
+    .tidyHead { color: #d9c48a; margin-bottom: 6px; }
+    .tidyRow { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 3px 0; }
+    .tidyRow .choices { display: flex; align-items: center; gap: 4px; color: #b9a46a; }
+    #tidyList button, .tidyFoot button { font: inherit; background: transparent; color: #f3d98b; border: 1px solid #8a7330; border-radius: 5px; padding: 1px 8px; cursor: pointer; }
+    #tidyList button.picked { background: #F7C449; color: #000; border-color: #F7C449; }
+    #tidyList button:disabled { opacity: 0.35; cursor: default; }
+    .tidyFoot { display: flex; gap: 8px; margin-top: 6px; }
+    .tidyFoot #tidyGo { background: #F7C449; color: #000; border: 0; padding: 3px 10px; }
+    .tidyFoot #tidyGo:disabled { opacity: 0.4; cursor: default; }
+  </style>
+</head>
+<body>
+  <header>
+    <button id="toTimeline" title="Back to LUNA's Timeline (Swipe Comp stays one click away on LUNA's toolbar)">← Timeline</button>
+    <button id="toMixer" title="Go to LUNA's Mixer">Mixer</button>
+    <button id="play" class="transport" title="Play or stop (Space). Plays from the playhead, or from the left edge of the screen if the playhead is off screen.">▶ Play</button>
+    <button id="solo" title="Solo this track, to hear the comp on its own">Solo</button>
+    <button id="undo" title="Undo (Cmd+Z)" disabled>↶ Undo</button>
+    <button id="redo" title="Redo (Shift+Cmd+Z)" disabled>↷ Redo</button>
+    <label>Track <select id="track"></select></label>
+    <label id="groupBox" hidden><input type="checkbox" id="groupOn" checked> <span id="groupLabel">Comp the group</span></label>
+    <label id="baseBox" title="Gaps in the comp play silence. Pick a take to fill every gap with it; the sections you chose stay. On an empty comp this starts the comp from the whole take."><span id="baseText">Fill gaps from</span> <select id="base"><option value="">a take…</option></select></label>
+    <button id="snap">Snap</button>
+    <label>Crossfade <input id="fade" type="number" min="0" max="250" step="1" value="10"> ms</label>
+    <button id="fit" title="Show all the takes">Fit</button>
+    <button id="zoomOut" title="Zoom out (Cmd+scroll)">−</button>
+    <button id="zoomIn" title="Zoom in (Cmd+scroll)">+</button>
+    <button id="clear" title="Empty the comp">Clear comp</button>
+    <button id="tidy" hidden title="Tiny gaps and scraps (under 100 ms) left where a swipe stopped just short of a section, or just past one. Pick which to clean up.">Tidy</button>
+    <span id="status">Connecting...</span>
+  </header>
+  <div id="notice"><span id="noticeText"></span><button id="noticeFix"></button><button id="noticeAlt" class="secondary"></button></div>
+  <div id="tidyPanel" hidden>
+    <div class="tidyHead">Tiny gaps and scraps, under 100 ms: usually left where a swipe stopped just short of a section, or just past one. For each, pick the take that fills it (or silence, for a scrap), or leave it. Apply makes your picks as one undo step; ones you leave stop being counted.</div>
+    <div id="tidyList"></div>
+    <div class="tidyFoot"><button id="tidyGo">Apply</button><button id="tidyClose" class="secondary">Close</button></div>
+  </div>
+  <div id="top" class="stage"><canvas id="topCanvas"></canvas><div class="playhead" id="ph1" hidden></div><button id="raise" hidden title="SwipeComp is below newer takes in LUNA's playlist list. Move it to the top, and keep it there as you comp.">↑ Move to top</button></div>
+  <div id="scroller"><div class="stage"><canvas id="takesCanvas"></canvas><div class="playhead" id="ph2" hidden></div><input id="rename" type="text" hidden spellcheck="false" autocomplete="off"></div><div id="empty"></div></div>
+  <footer>Space or ▶ Play plays and stops. Drag across a take to use it there. Drag a lit section's edge, or a seam in the comp, to move it. Fill gaps from fills the comp's silent gaps with one take. Tidy lists tiny gaps and scraps left by swipes. Snap uses LUNA's own grid. Click a take to switch the comp section under the pointer to it. Swipe across Silence (under the comp) to erase that stretch, or click it to erase the section above; Option-drag on a take does the same. Click a take's name to hear it alone, and Comp to hear the comp. Double-click a take's name to rename it. Click the ruler to move the playhead. LUNA's markers show above the bar numbers; click one to go there. Cmd+scroll zooms, sideways scroll moves along.</footer>
+  <script src="vendor/luna.global.js"></script>
+  <script src="logic.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
