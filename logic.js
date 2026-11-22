@@ -365,7 +365,7 @@ const AddOnLogic = {
    * with the matching span of the recording. Assumes takes are not time-stretched (recorded
    * takes are not).
    */
-  plan(session, segments) {
+  plan(session, segments, warped) {
     const t = session.musical.timeline, pieces = [];
     for (const s of segments) {
       const take = session.playlists.byId(s.take);
@@ -381,7 +381,7 @@ const AddOnLogic = {
         }
         const at = (tick) => clip.sourceStart.value + (t.seconds(tick) - t.seconds(clip.start.value)) * 1e9;
         pieces.push({
-          clip, take: s.take, name: take.name.value ?? clip.name.value,
+          clip, take: s.take, name: take.name.value ?? clip.name.value, warped: !!warped?.has(clip.id),
           startTick: a, stopTick: b, sourceStartNs: Math.round(at(a)), sourceStopNs: Math.round(at(b)),
         });
       }
@@ -443,8 +443,9 @@ const AddOnLogic = {
   /** Comp clips whose name is not their take's name, with the name each should have. */
   misnamedCompClips(session, lane, segments) {
     const out = [];
+    const byLuna = lane ? new Set(AddOnLogic.madeByLuna(session, session.tracks.byId(lane.trackUid.value), lane)) : new Set();
     for (const clip of lane?.clips.items ?? []) {
-      if (clip.clipType.value === 'midi') continue;   // LUNA names a promoted MIDI piece; left as it is
+      if (clip.clipType.value === 'midi' || byLuna.has(clip)) continue;   // LUNA names what it promotes; left as it is
       const take = AddOnLogic.takeOfClip(session, lane, segments, clip);
       const name = take && session.playlists.byId(take)?.name.value;
       if (name && clip.name.value !== name) out.push({ clip, name });
@@ -545,24 +546,53 @@ const AddOnLogic = {
   },
 
   /**
+   * The ids of the take clips `segments` draw on that are warped in LUNA. Their sections are
+   * copied by LUNA's promote_takes: LUNA's insert_clip copy of a warped clip at a new start puts
+   * its warp markers in the wrong place (it takes the new clip's start off each marker without
+   * adding the old one's; measured on LUNA 3.1.2), while promote_takes keeps them where they were.
+   */
+  async warpedTakeClips(session, segments) {
+    const out = new Set();
+    for (const id of new Set(segments.map((s) => s.take))) {
+      for (const c of session.playlists.byId(id)?.clips.items ?? []) if (await AddOnLogic.isWarped(session, c)) out.add(c.id);
+    }
+    return out;
+  },
+
+  /** The comp's clips that Swipe Comping had LUNA make (placed with no id), found by span. */
+  madeByLuna(session, track, lane) {
+    const placed = AddOnLogic.store(session).value(track.id, 'placed').value;
+    const recs = Array.isArray(placed) ? placed.filter((r) => !r.id) : [];
+    return (lane?.clips.items ?? []).filter((c) => recs.some((r) => Math.abs(r.start - c.start.value) <= 1 && Math.abs(r.stop - c.stop.value) <= 1));
+  },
+
+  /**
    * Comp clips a change to `segments` would replace: those the rewrite does not keep. A rewrite
    * that starts over (no record of the clips, or a new crossfade length) replaces them all, and
    * so does every MIDI change (a MIDI comp is rewritten whole).
    */
-  clipsReplaced(session, track, lane, segments, { fadeMs = 10 } = {}) {
+  clipsReplaced(session, track, lane, segments, { fadeMs = 10, warped } = {}) {
     const all = lane?.clips.items ?? [];
     if (!all.length || AddOnLogic.isMidiTrack(track)) return [...all];
     const placed = AddOnLogic.store(session).value(track.id, 'placed').value;
     const lastFade = AddOnLogic.savedFadeMs(session, track);
     if (!Array.isArray(placed) || (lastFade !== undefined && lastFade !== fadeMs)) return [...all];
-    const kept = new Set(AddOnLogic.reusableClips(lane, placed, AddOnLogic.plan(session, AddOnLogic.merge(segments))).values());
+    const kept = new Set(AddOnLogic.reusableClips(lane, placed, AddOnLogic.plan(session, AddOnLogic.merge(segments), warped)).values());
     return all.filter((c) => !kept.has(c));
   },
 
-  /** Of the comp clips a change would replace, those warped in LUNA (their warps would be lost). */
+  /**
+   * Of the comp clips a change would replace, those warped in LUNA (their warps would be lost).
+   * Not the clips Swipe Comping had LUNA copy from a warped take: their warps are the take's, and
+   * come back with the take.
+   */
   async warpedClipsReplaced(session, track, lane, segments, options = {}) {
+    const warped = await AddOnLogic.warpedTakeClips(session, segments);
+    const ours = new Set(AddOnLogic.madeByLuna(session, track, lane));
     const out = [];
-    for (const c of AddOnLogic.clipsReplaced(session, track, lane, segments, options)) if (await AddOnLogic.isWarped(session, c)) out.push(c);
+    for (const c of AddOnLogic.clipsReplaced(session, track, lane, segments, { ...options, warped })) {
+      if (!ours.has(c) && await AddOnLogic.isWarped(session, c)) out.push(c);
+    }
     return out;
   },
 
@@ -712,18 +742,24 @@ const AddOnLogic = {
    * (clip gain, a crossfade edited in the Timeline).
    */
   reusableClips(lane, placed, pieces) {
-    const keep = new Map(), used = new Set();
+    const keep = new Map(), usedRec = new Set(), usedClip = new Set();
     if (!Array.isArray(placed)) return keep;
-    const clips = new Map((lane?.clips.items ?? []).map((c) => [c.id, c]));
+    const items = lane?.clips.items ?? [];
+    const clips = new Map(items.map((c) => [c.id, c]));
+    const near = (a0, a1, b0, b1) => Math.abs(a0 - b0) <= 1 && Math.abs(a1 - b1) <= 1;
     for (const [i, p] of pieces.entries()) {
-      const rec = placed.find((r) => !used.has(r.id) && r.take === p.take
-        && Math.abs(r.start - p.startTick) <= 1 && Math.abs(r.stop - p.stopTick) <= 1);
-      const c = rec && clips.get(rec.id);
-      if (!c) continue;
-      if (Math.abs(c.start.value - rec.start) > 1 || Math.abs(c.stop.value - rec.stop) > 1) continue;
-      if (!(Math.abs(c.sourceStart.value - p.sourceStartNs) <= 2000)) continue;
+      const rec = placed.find((r) => !usedRec.has(r) && r.take === p.take && near(r.start, r.stop, p.startTick, p.stopTick));
+      if (!rec) continue;
+      // A record without an id is a clip LUNA made (promote_takes): found by its span.
+      const c = rec.id ? clips.get(rec.id) : items.find((x) => !usedClip.has(x) && near(x.start.value, x.stop.value, rec.start, rec.stop));
+      if (!c || usedClip.has(c)) continue;
+      if (!near(c.start.value, c.stop.value, rec.start, rec.stop)) continue;
+      // A piece from a warped take is kept only if LUNA made it (an earlier straight copy has its
+      // warps in the wrong place); any other piece only while it still starts where it should.
+      if (p.warped ? !!rec.id : !(Math.abs(c.sourceStart.value - p.sourceStartNs) <= 2000)) continue;
       keep.set(i, c);
-      used.add(rec.id);
+      usedRec.add(rec);
+      usedClip.add(c);
     }
     return keep;
   },
@@ -928,9 +964,10 @@ const AddOnLogic = {
    */
   async buildComp(session, track, lane, segments, options = {}) {
     await AddOnLogic.loadTakes(session, segments);
+    const warped = await AddOnLogic.warpedTakeClips(session, segments);
     await AddOnLogic.prepareComp(session, track, lane);
     let n = 0;
-    await session.transaction('Swipe Comp', async () => { n = await AddOnLogic.writeComp(session, track, lane, segments, options); });
+    await session.transaction('Swipe Comp', async () => { n = await AddOnLogic.writeComp(session, track, lane, segments, { ...options, warped }); });
     return n;
   },
 
@@ -948,19 +985,20 @@ const AddOnLogic = {
     }
     for (const m of all) {
       await AddOnLogic.loadTakes(session, m.list);
+      m.warped = await AddOnLogic.warpedTakeClips(session, m.list);
       await AddOnLogic.prepareComp(session, m.track, m.lane);
     }
     const raise = AddOnLogic.keepsOnTop(session, lead);
     await session.transaction('Swipe Comp', async () => {
-      for (const m of all) await AddOnLogic.writeComp(session, m.track, m.lane, m.list, { ...options, raise });
+      for (const m of all) await AddOnLogic.writeComp(session, m.track, m.lane, m.list, { ...options, raise, warped: m.warped });
     });
     return all.map((m) => m.lane);
   },
 
   /** The body of a comp change, inside the caller's transaction (see buildComp). */
-  async writeComp(session, track, lane, segments, { fadeMs = 10, full = false, raise } = {}) {
+  async writeComp(session, track, lane, segments, { fadeMs = 10, full = false, raise, warped } = {}) {
     const list = AddOnLogic.merge(segments);
-    const pieces = AddOnLogic.plan(session, list);
+    const pieces = AddOnLogic.plan(session, list, warped);
     if (AddOnLogic.isMidiTrack(track)) return AddOnLogic.writeMidiComp(session, track, lane, list, pieces, { raise });
     const store = AddOnLogic.store(session);
     const placedBefore = store.value(track.id, 'placed').value;
@@ -979,6 +1017,10 @@ const AddOnLogic = {
         let clip = keep.get(i);
         if (clip) {
           if (clip.name.value !== p.name) await clip.name.set(p.name);
+        } else if (p.warped) {
+          // From a warped take: LUNA copies it, warps in place (see warpedTakeClips). LUNA makes
+          // the clip, so its id is not known here, and the comp's seams are faded by range below.
+          await AddOnLogic.contextCommand(session, 'promote_takes', { context_type: 'main', playlist_uid: [p.take], start: p.startTick, stop: p.stopTick });
         } else {
           // Each comp clip is named after its take, so LUNA's own Timeline shows where it came from.
           clip = await session.insertClip({
@@ -988,7 +1030,10 @@ const AddOnLogic = {
         }
         ids.push(clip?.id);
         fresh.push(!keep.has(i));
-        if (placed && clip?.id) placed.push({ id: clip.id, start: p.startTick, stop: p.stopTick, take: p.take });
+        // A piece from a warped take is recorded without an id, kept or new: LUNA made it, its warps
+        // are the take's (see madeByLuna), and it is found again by its span.
+        if (placed && p.warped) placed.push({ id: null, start: p.startTick, stop: p.stopTick, take: p.take });
+        else if (placed && clip?.id) placed.push({ id: clip.id, start: p.startTick, stop: p.stopTick, take: p.take });
         else placed = null;   // no record rather than a wrong one
       }
       await store.set(track.id, 'placed', placed, { undoable: true });

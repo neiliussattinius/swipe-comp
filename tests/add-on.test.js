@@ -451,6 +451,63 @@ describe('warped comp clips', () => {
   });
 });
 
+describe('sections from a warped take', () => {
+  afterEach(() => { L.contextCommand = realContextCommand; });
+
+  it("are copied by LUNA's promote_takes, crossfaded, kept by later changes, and not taken for the user's warps", async () => {
+    const { engine, session, track, lanes } = await sessionWithTakes();
+    // Take 2 is warped in LUNA: a marker moved from where it was set.
+    const takeClip = lanes[1].clips.items[0];
+    engine.addNode(`${takeClip.path}/warps/589`, { properties: { rowid: 589, type: 'warp', warp_type: 0, start: 514e9, start_original: 576e9, source_start: 3.6e9, source_start_original: 3.6e9 } });
+    await engine.settled();
+    // promote_takes, which the mock lacks: copy the take's clip, cut to the range, into the
+    // track's current playlist, warps and all, with a uid unique in the session.
+    const calls = [];
+    let promoted = 0;
+    L.contextCommand = (s2, name, payload) => {
+      calls.push(name);
+      if (name !== 'promote_takes') return realContextCommand(s2, name, payload);
+      for (const pl of payload.playlist_uid) {
+        const dest = String(engine.value(`/sessions/s/tracks/${engine.value(`/sessions/s/playlists/${pl}`, 'track_uid')}`, 'playlist_uid'));
+        for (const c of engine.children(`/sessions/s/playlists/${pl}/clips`)) {
+          const from = `/sessions/s/playlists/${pl}/clips/${c}`, start = engine.value(from, 'start'), stop = engine.value(from, 'stop');
+          const a = Math.max(start, payload.start), b = Math.min(stop, payload.stop);
+          if (!(b > a)) continue;
+          const id = `promoted${++promoted}`, to = `/sessions/s/playlists/${dest}/clips/${id}`;
+          const props = Object.fromEntries(['name', 'source_uid', 'source_stop', 'clip_type', 'gain', 'bypass', 'render_state', 'midi_source_start', 'layer', 'mute'].map((k) => [k, engine.value(from, k)]));
+          engine.addNode(to, { properties: { ...props, uid: id, start: a, stop: b, source_start: engine.value(from, 'source_start') + (a - start) / BAR * 1e9, render_source_uid: '' } });
+          engine.addNode(`${to}/warps/9${promoted}`, { properties: { rowid: 900 + promoted, type: 'warp', warp_type: 0, start: 1e9, start_original: 2e9, source_start: 3.6e9, source_start_original: 3.6e9 } });
+        }
+      }
+      return Promise.resolve(null);
+    };
+    const comp = await L.ensureCompLane(session, track);
+    let list = L.applySwipe([], lanes[0].id, 0, 2 * BAR);
+    list = L.applySwipe(list, lanes[1].id, 2 * BAR, 4 * BAR);
+    await L.buildComp(session, track, comp, list);
+    await L.setFadeMs(session, track, 10);
+    await engine.settled();
+    await comp.clips.load();
+    expect(calls.filter((c) => c === 'promote_takes')).toHaveLength(1);
+    expect(comp.clips.items.map((c) => [c.start.value / BAR, c.stop.value / BAR, c.id.startsWith('promoted')]).sort()).toEqual([[0, 2, false], [2, 4, true]]);
+    const made = comp.clips.items.find((c) => c.id.startsWith('promoted'));
+    expect(L.foreignClips(session, comp, track)).toEqual([]);
+    expect(L.madeByLuna(session, track, comp)).toEqual([made]);
+    expect(L.misnamedCompClips(session, comp, list).map((m) => m.clip)).not.toContain(made);
+    // A later change elsewhere keeps it (no second copy), and the warp guard does not take the
+    // take's own warps for the user's, even for a change across it.
+    calls.length = 0;
+    const later = L.applySwipe(L.savedSegments(session, track), lanes[2].id, 6 * BAR, 7 * BAR);
+    expect(await L.warpedClipsReplaced(session, track, comp, later)).toEqual([]);
+    expect(await L.warpedClipsReplaced(session, track, comp, L.applySwipe(list, lanes[2].id, 3 * BAR, 5 * BAR))).toEqual([]);
+    await L.buildComp(session, track, comp, later);
+    await engine.settled();
+    await comp.clips.load();
+    expect(calls.includes('promote_takes')).toBe(false);
+    expect(comp.clips.items).toContain(made);
+  });
+});
+
 describe('comping MIDI', () => {
   afterEach(() => { L.contextCommand = realContextCommand; });
 
