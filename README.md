@@ -8,7 +8,7 @@ Swipe Comping is a full LUNA page that shows every take on a track at once, stac
 folder. Drag across the part of a take you want, and it goes into the comp, crossfaded at every
 seam. It works the way Quick Swipe Comping works in Logic Pro.
 
-![Swipe Comping on a MIDI track: three takes, and a comp built from a part of each](docs/screenshot-midi.png)
+![Swipe Comping on a vocal track: the comp on top, built from three takes, each take's part lit in its own colour](docs/screenshot-audio.png)
 
 Needs LUNA 3.1.2 or newer. Tested on macOS; not yet on Windows.
 
@@ -87,6 +87,8 @@ swipe across them just as with audio. Swipe Comping builds the comp with LUNA's 
 promoting, so each section is LUNA's copy of that stretch of the take, with every note where
 it was played; notes at a section's edges behave as they do when you trim a MIDI clip in LUNA.
 MIDI has no crossfades (LUNA fades audio clips only), so the Crossfade setting is hidden.
+
+![Swipe Comping on a MIDI track: three takes, and a comp built from a part of each](docs/screenshot-midi.png)
 
 ## Things to know
 
