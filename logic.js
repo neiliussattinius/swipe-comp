@@ -559,11 +559,27 @@ const AddOnLogic = {
     return out;
   },
 
-  /** The comp's clips that Swipe Comping had LUNA make (placed with no id), found by span. */
+  /**
+   * The comp's clips that Swipe Comping had LUNA make from a warped take (recorded `byLuna`, or
+   * with no id by an earlier version), by id or else by span.
+   */
   madeByLuna(session, track, lane) {
     const placed = AddOnLogic.store(session).value(track.id, 'placed').value;
-    const recs = Array.isArray(placed) ? placed.filter((r) => !r.id) : [];
-    return (lane?.clips.items ?? []).filter((c) => recs.some((r) => Math.abs(r.start - c.start.value) <= 1 && Math.abs(r.stop - c.stop.value) <= 1));
+    const recs = Array.isArray(placed) ? placed.filter((r) => r.byLuna || !r.id) : [];
+    const near = (r, c) => Math.abs(r.start - c.start.value) <= 1 && Math.abs(r.stop - c.stop.value) <= 1;
+    return (lane?.clips.items ?? []).filter((c) => recs.some((r) => (r.id ? r.id === c.id : near(r, c))));
+  },
+
+  /**
+   * The uid of the clip LUNA has just made on `lane` over `start`-`stop` (promote_takes answers
+   * nothing), not one of `known`. LUNA shows it at once, inside the change, so the change can
+   * name and crossfade it in the same undo step (measured on LUNA 3.1.2).
+   */
+  async clipMadeAt(session, lane, start, stop, known) {
+    const node = await session.client.raw.get(`${lane.path}/clips`, { levels: 2 });
+    const hit = (node?.children ?? []).map((c) => c.properties ?? {})
+      .find((p) => p.uid?.value && !known.has(p.uid.value) && Math.abs(p.start?.value - start) <= 1 && Math.abs(p.stop?.value - stop) <= 1);
+    return hit?.uid.value;
   },
 
   /**
@@ -756,7 +772,7 @@ const AddOnLogic = {
       if (!near(c.start.value, c.stop.value, rec.start, rec.stop)) continue;
       // A piece from a warped take is kept only if LUNA made it (an earlier straight copy has its
       // warps in the wrong place); any other piece only while it still starts where it should.
-      if (p.warped ? !!rec.id : !(Math.abs(c.sourceStart.value - p.sourceStartNs) <= 2000)) continue;
+      if (p.warped ? !(rec.byLuna || !rec.id) : !(Math.abs(c.sourceStart.value - p.sourceStartNs) <= 2000)) continue;
       keep.set(i, c);
       usedRec.add(rec);
       usedClip.add(c);
@@ -1012,15 +1028,20 @@ const AddOnLogic = {
       const kept = new Set(keep.values());
       for (const c of [...lane.clips.items]) if (!kept.has(c)) await c.delete();
       let placed = [];
-      const ids = [], fresh = [];
+      const ids = [], fresh = [], known = new Set([...keep.values()].map((c) => c.id));
       for (const [i, p] of pieces.entries()) {
         let clip = keep.get(i);
         if (clip) {
           if (clip.name.value !== p.name) await clip.name.set(p.name);
         } else if (p.warped) {
-          // From a warped take: LUNA copies it, warps in place (see warpedTakeClips). LUNA makes
-          // the clip, so its id is not known here, and the comp's seams are faded by range below.
+          // From a warped take: LUNA copies it, warps in place (see warpedTakeClips), then the clip
+          // it made is found by its place, named after its take and crossfaded like any other.
           await AddOnLogic.contextCommand(session, 'promote_takes', { context_type: 'main', playlist_uid: [p.take], start: p.startTick, stop: p.stopTick });
+          const uid = await AddOnLogic.clipMadeAt(session, lane, p.startTick, p.stopTick, known);
+          if (uid) {
+            clip = { id: uid };
+            await session.client.raw.set(`${lane.path}/clips/${uid}/name`, p.name).catch(() => {});
+          }
         } else {
           // Each comp clip is named after its take, so LUNA's own Timeline shows where it came from.
           clip = await session.insertClip({
@@ -1029,10 +1050,11 @@ const AddOnLogic = {
           });
         }
         ids.push(clip?.id);
+        if (clip?.id) known.add(clip.id);
         fresh.push(!keep.has(i));
-        // A piece from a warped take is recorded without an id, kept or new: LUNA made it, its warps
-        // are the take's (see madeByLuna), and it is found again by its span.
-        if (placed && p.warped) placed.push({ id: null, start: p.startTick, stop: p.stopTick, take: p.take });
+        // A piece from a warped take is recorded as LUNA's (`byLuna`), kept or new: its warps are the
+        // take's (see madeByLuna). Should LUNA not show its clip, it is recorded by span alone.
+        if (placed && p.warped) placed.push({ id: clip?.id ?? null, start: p.startTick, stop: p.stopTick, take: p.take, byLuna: true });
         else if (placed && clip?.id) placed.push({ id: clip.id, start: p.startTick, stop: p.stopTick, take: p.take });
         else placed = null;   // no record rather than a wrong one
       }

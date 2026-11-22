@@ -494,6 +494,9 @@ describe('sections from a warped take', () => {
     expect(L.foreignClips(session, comp, track)).toEqual([]);
     expect(L.madeByLuna(session, track, comp)).toEqual([made]);
     expect(L.misnamedCompClips(session, comp, list).map((m) => m.clip)).not.toContain(made);
+    // Found inside the change: named after its take and recorded by id as LUNA's.
+    expect(made.name.value).toBe(lanes[1].name.value);
+    expect(L.store(session).value(track.id, 'placed').value.find((r) => r.byLuna)).toMatchObject({ id: made.id, byLuna: true });
     // A later change elsewhere keeps it (no second copy), and the warp guard does not take the
     // take's own warps for the user's, even for a change across it.
     calls.length = 0;
