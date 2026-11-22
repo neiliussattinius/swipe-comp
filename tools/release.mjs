@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const git = (...args) => execFileSync('git', args, { cwd: root, maxBuffer: 64 * 1024 * 1024 });
 
-const DEV_ONLY = [/^tools\//, /^tests\//, /^package(-lock)?\.json$/, /^vitest\.config\./, /^\./, /^README\.md$/, /^icon\.svg$/, /^docs\//, /^DEVELOPING\.md$/];
+const DEV_ONLY = [/^tools\//, /^tests\//, /^package(-lock)?\.json$/, /^vitest\.config\./, /^\./, /^icon\.svg$/, /^DEVELOPING\.md$/];
 
 const dirty = git('status', '--porcelain').toString().trim();
 if (dirty) console.warn('Note: there are uncommitted changes; the package is built from the last commit, without them.\n');
