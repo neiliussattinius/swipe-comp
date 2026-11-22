@@ -326,13 +326,18 @@ const AddOnLogic = {
   },
 
   /**
-   * Tracks that can be comped: every audio track, even one with a single take (one long
-   * recording, comped by keeping the parts you want), and any other track with several
-   * playlists. In the session's own order.
+   * Tracks that can be comped: every audio and instrument (MIDI) track, even one with a single
+   * take (one long recording, comped by keeping the parts you want), and any other track with
+   * several playlists. In the session's own order.
    */
   compableTracks(session) {
     return session.visibleTracks.filter((t) =>
-      t.trackType.value === 'audio' || AddOnLogic.playlistsOf(session, t).length > 1);
+      t.trackType.value === 'audio' || AddOnLogic.isMidiTrack(t) || AddOnLogic.playlistsOf(session, t).length > 1);
+  },
+
+  /** An instrument track: its takes are MIDI clips, comped by LUNA's own promote_takes, with no fades. */
+  isMidiTrack(track) {
+    return track?.trackType.value === 'instrument';
   },
 
   store(session) {
@@ -369,7 +374,11 @@ const AddOnLogic = {
         const a = Math.max(s.start, piece.start), b = Math.min(s.stop, piece.stop);
         if (!(b > a)) continue;
         const clip = piece.clip;
-        if (clip.clipType.value === 'midi') continue;
+        if (clip.clipType.value === 'midi') {
+          // A MIDI piece is copied by LUNA (promote_takes), so it needs no offsets into a file.
+          pieces.push({ clip, take: s.take, name: take.name.value ?? clip.name.value, startTick: a, stopTick: b, midi: true });
+          continue;
+        }
         const at = (tick) => clip.sourceStart.value + (t.seconds(tick) - t.seconds(clip.start.value)) * 1e9;
         pieces.push({
           clip, take: s.take, name: take.name.value ?? clip.name.value,
@@ -435,6 +444,7 @@ const AddOnLogic = {
   misnamedCompClips(session, lane, segments) {
     const out = [];
     for (const clip of lane?.clips.items ?? []) {
+      if (clip.clipType.value === 'midi') continue;   // LUNA names a promoted MIDI piece; left as it is
       const take = AddOnLogic.takeOfClip(session, lane, segments, clip);
       const name = take && session.playlists.byId(take)?.name.value;
       if (name && clip.name.value !== name) out.push({ clip, name });
@@ -504,10 +514,13 @@ const AddOnLogic = {
   foreignClips(session, lane, track) {
     const placed = AddOnLogic.store(session).value(track.id, 'placed').value;
     if (!Array.isArray(placed)) return [];
-    const ours = new Map(placed.map((p) => [p.id, p]));
+    const ours = new Map(placed.filter((p) => p.id).map((p) => [p.id, p]));
+    const bySpan = placed.filter((p) => !p.id);   // MIDI comp clips: LUNA makes them, so no id is known
+    const near = (p, c) => Math.abs(p.start - c.start.value) <= 1 && Math.abs(p.stop - c.stop.value) <= 1;
     return (lane?.clips.items ?? []).filter((c) => {
       const p = ours.get(c.id);
-      return !p || Math.abs(p.start - c.start.value) > 1 || Math.abs(p.stop - c.stop.value) > 1;
+      if (p) return !near(p, c);
+      return !bySpan.some((q) => near(q, c));
     });
   },
 
@@ -906,6 +919,7 @@ const AddOnLogic = {
   async writeComp(session, track, lane, segments, { fadeMs = 10, full = false, raise } = {}) {
     const list = AddOnLogic.merge(segments);
     const pieces = AddOnLogic.plan(session, list);
+    if (AddOnLogic.isMidiTrack(track)) return AddOnLogic.writeMidiComp(session, track, lane, list, pieces, { raise });
     const store = AddOnLogic.store(session);
     const placedBefore = store.value(track.id, 'placed').value;
     const lastFade = AddOnLogic.savedFadeMs(session, track);
@@ -954,6 +968,28 @@ const AddOnLogic = {
       }
       await store.set(track.id, 'segments', list, { undoable: true });
     }
+    return pieces.length;
+  },
+
+  /**
+   * The body of a MIDI comp change, inside the caller's transaction. LUNA cannot copy part of a
+   * MIDI clip that has no file behind it (insert_clip refuses it, measured on LUNA 3.1.2),
+   * so each section is copied by LUNA's own comping command, promote_takes, which copies a
+   * range of a take into the track's current playlist (the comp, made current beforehand by
+   * prepareComp), notes in place, cut at the range. The whole comp is rewritten each time (no
+   * fades to keep), with no crossfades: LUNA fades audio clips only. LUNA makes the clips, so
+   * their ids are not known here; the record keeps their spans instead (see foreignClips).
+   */
+  async writeMidiComp(session, track, lane, list, pieces, { raise } = {}) {
+    const store = AddOnLogic.store(session);
+    if (raise ?? AddOnLogic.keepsOnTop(session, track)) await AddOnLogic.raiseComp(session, track, lane);
+    for (const c of [...lane.clips.items]) await c.delete();
+    for (const s of list) {
+      if (!pieces.some((p) => p.take === s.take && p.stopTick > s.start && p.startTick < s.stop)) continue;
+      await AddOnLogic.contextCommand(session, 'promote_takes', { context_type: 'main', playlist_uid: [s.take], start: s.start, stop: s.stop });
+    }
+    await store.set(track.id, 'placed', pieces.map((p) => ({ id: null, start: p.startTick, stop: p.stopTick, take: p.take })), { undoable: true });
+    await store.set(track.id, 'segments', list, { undoable: true });
     return pieces.length;
   },
 

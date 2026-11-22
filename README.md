@@ -76,6 +76,14 @@ it to make it the track you're working on.
 Group comping has been tried in LUNA on a group made from a copied track, not yet on a group
 recorded together (a drum kit, say). Reports welcome.
 
+## MIDI tracks
+
+Instrument tracks comp the same way. Each take shows its notes instead of a waveform, and you
+swipe across them just as with audio. Swipe Comping builds the comp with LUNA's own take
+promoting, so each section is LUNA's copy of that stretch of the take, with every note where
+it was played; notes at a section's edges behave as they do when you trim a MIDI clip in LUNA.
+MIDI has no crossfades (LUNA fades audio clips only), so the Crossfade setting is hidden.
+
 ## Things to know
 
 - The comp is an ordinary LUNA playlist named "SwipeComp" on the track, made the first time
@@ -88,7 +96,7 @@ recorded together (a drum kit, say). Reports welcome.
 - LUNA has no waveform for a take until it has been on the Timeline. When the page opens a
   track it shows each such take for a moment, which leaves one undo step, "Draw take
   waveforms", that changes nothing.
-- Audio tracks only for now. MIDI comping is not built yet.
+- Grouped MIDI tracks comp one track at a time for now; group comping is audio only.
 - Takes are assumed not to be time-stretched. Warped takes are not supported.
 - What the page remembers (the comp's sections, which playlist is SwipeComp) is saved inside
   the LUNA session.

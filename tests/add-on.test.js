@@ -1,6 +1,6 @@
 // Runs against Luna.MockEngine: no LUNA needed. `npm test`.
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 // The SDK bundle the page itself loads (vendor/luna.global.js, Luna.MockEngine included), so the
 // tests run the code that ships and need nothing from UA beyond this folder.
@@ -10,6 +10,7 @@ globalThis.Luna = Luna; // logic.js is a classic script that reads the Luna glob
 await import('../logic.js');
 const L = globalThis.AddOnLogic;
 const BAR = Luna.WHOLE_NOTE;
+const BEAT = Luna.QUARTER_NOTE;
 
 describe('the comp list', () => {
   it('a swipe takes over what it covers and splits what it lands inside', () => {
@@ -344,6 +345,114 @@ async function groupSession({ extraAmpTake = false, recordedAmpTake = false } = 
   for (const p of session.playlists.items) await p.clips.load();
   return { engine, session, di, amp };
 }
+
+// An instrument track with three MIDI takes of bars 1-4, each a different line, for MIDI comping.
+const realContextCommand = L.contextCommand;
+async function midiSession() {
+  const engine = new Luna.MockEngine();
+  engine.addSession('s', { name: 'Demo', tracks: ['Vox'], packageUid: 'pkg' });
+  // The mock's set_playlists answers without switching; make it switch, as LUNA does.
+  engine.overrideCommand('/sessions/s/set_playlists', (data, e) => {
+    for (const t of data.track_uid) {
+      const pl = e.children('/sessions/s/playlists').find((p) =>
+        e.value(`/sessions/s/playlists/${p}`, 'track_uid') === t && e.value(`/sessions/s/playlists/${p}`, 'version') === data.version);
+      if (pl) e.setValue(`/sessions/s/tracks/${t}`, 'playlist_uid', pl);
+    }
+    return null;
+  });
+  await engine.settled();
+  const luna = await Luna.connect({ port_: engine.port() });
+  const session = await luna.session();
+  await session.ready();
+  await Promise.all([session.musical.ready(), session.playlists.load(), L.store(session).load()]);
+  const [keys] = await session.newTrack({ name: 'Keys', trackType: 'instrument' });
+  await engine.settled();
+  await session.playlists.membersReady();
+  for (let i = 1; i < 3; i++) await session.newPlaylists([keys.id]);
+  await engine.settled();
+  await session.playlists.membersReady();
+  const lanes = L.playlistsOf(session, keys);
+  for (const [i, lane] of lanes.entries()) {
+    // Take i plays pitch 60 + i on every beat of bars 1-4.
+    await lane.createNotes(Array.from({ length: 16 }, (_, k) => ({ pitch: 60 + i, startTick: k * BEAT, stopTick: (k + 1) * BEAT - BEAT / 4 })));
+  }
+  await engine.settled();
+  for (const lane of lanes) await lane.clips.load();
+  // LUNA's promote_takes (which the mock lacks): copy what a take has in a range into the track's
+  // current playlist, notes in place, cut to the range, as measured on LUNA 3.1.2.
+  const calls = [];
+  let promoted = 0;
+  L.contextCommand = (s2, name, payload) => {
+    calls.push(name);
+    if (name !== 'promote_takes') return realContextCommand(s2, name, payload);
+    for (const pl of payload.playlist_uid) {
+      const trackUid = engine.value(`/sessions/s/playlists/${pl}`, 'track_uid');
+      const dest = String(engine.value(`/sessions/s/tracks/${trackUid}`, 'playlist_uid'));
+      for (const c of engine.children(`/sessions/s/playlists/${pl}/clips`)) {
+        const at = `/sessions/s/playlists/${pl}/clips/${c}`;
+        const start = engine.value(at, 'start'), stop = engine.value(at, 'stop');
+        const a = Math.max(start, payload.start), b = Math.min(stop, payload.stop);
+        if (!(b > a)) continue;
+        // A uid unique in the session, as LUNA's are (the mock numbers MIDI clips per playlist).
+        const id = `promoted${++promoted}`, to = `/sessions/s/playlists/${dest}/clips/${id}`;
+        engine.addNode(to, { properties: {
+          uid: id, name: engine.value(at, 'name'), start: a, stop: b, source_uid: '', source_start: a, source_stop: b, clip_type: 2,
+          gain: 0, bypass: false, render_source_uid: null, render_state: 'none', midi_source_start: engine.value(at, 'midi_source_start') + (a - start), layer: 0, mute: false,
+        } });
+        engine.addNode(`${to}/midi/table`, { properties: { row_data: engine.value(`${at}/midi/table`, 'row_data') } });
+      }
+    }
+    return Promise.resolve(null);
+  };
+  return { engine, session, keys, lanes, calls };
+}
+const playedNotes = async (lane) => {
+  await lane.clips.load();
+  const out = [];
+  for (const c of lane.clips.items) {
+    await c.midi.ready();
+    for (const n of c.midi.notes.items) {
+      const on = c.start.value + n.startTick;
+      if (on >= c.start.value && on < c.stop.value) out.push([on / BEAT, n.pitch]);
+    }
+  }
+  return out.sort((x, y) => x[0] - y[0]);
+};
+
+describe('comping MIDI', () => {
+  afterEach(() => { L.contextCommand = realContextCommand; });
+
+  it('counts an instrument track as comp-able, even with one take', async () => {
+    const { session, keys } = await midiSession();
+    expect(L.isMidiTrack(keys)).toBe(true);
+    expect(L.compableTracks(session)).toContain(keys);
+  });
+
+  it("copies each section's notes in place from its own take, with no fades, as one undo step", async () => {
+    const { engine, session, keys, lanes, calls } = await midiSession();
+    const comp = await L.ensureCompLane(session, keys);
+    let list = L.applySwipe([], lanes[0].id, 0, 4 * BEAT);
+    list = L.applySwipe(list, lanes[2].id, 4 * BEAT, 6 * BEAT);
+    engine.transactions.length = 0;
+    await L.buildComp(session, keys, comp, list);
+    await engine.settled();
+    expect(engine.transactions).toEqual(['begin', 'commit']);
+    expect(calls.filter((c) => c === 'promote_takes')).toHaveLength(2);
+    expect(calls.some((c) => c === 'set_fade' || c === 'delete_fades')).toBe(false);
+    // Beats 0-3 from take 1 (pitch 60), beats 4-5 from take 3 (pitch 62), nothing after.
+    expect(await playedNotes(comp)).toEqual([[0, 60], [1, 60], [2, 60], [3, 60], [4, 62], [5, 62]]);
+    // The page knows these clips as its own, though LUNA made them.
+    expect(L.foreignClips(session, comp, keys)).toEqual([]);
+  });
+
+  it('rewrites the whole comp on a change', async () => {
+    const { session, keys, lanes } = await midiSession();
+    const comp = await L.ensureCompLane(session, keys);
+    await L.buildComp(session, keys, comp, L.applySwipe([], lanes[1].id, 0, 8 * BEAT));
+    await L.buildComp(session, keys, comp, L.applySwipe(L.savedSegments(session, keys), lanes[0].id, 2 * BEAT, 3 * BEAT));
+    expect((await playedNotes(comp)).map(([, p]) => p)).toEqual([61, 61, 60, 61, 61, 61, 61, 61]);
+  });
+});
 
 describe('comping an edit group', () => {
   it("finds the group's other tracks as LUNA reports them", async () => {

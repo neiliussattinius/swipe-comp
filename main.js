@@ -136,7 +136,8 @@ async function refreshGroup() {
   if (!session || !forTrack) { mates = []; uneven = []; groupMode = 'none'; afterGroupChange(); return; }
   const [linked, groups] = await Promise.all([L.groupMates(session, forTrack), L.groupsOf(session, forTrack)]);
   const plan = L.groupPlan(groups, linked.map((t) => t.id));
-  const found = plan.trackIds.map((id) => session.tracks.byId(id)).filter((t) => t && t.trackType.value === 'audio');
+  // Audio groups only for now: a MIDI track comps alone (group comping of MIDI not built or measured).
+  const found = L.isMidiTrack(forTrack) ? [] : plan.trackIds.map((id) => session.tracks.byId(id)).filter((t) => t && t.trackType.value === 'audio');
   for (const t of found) await Promise.all(L.playlistsOf(session, t).map((p) => p.clips.load()));
   if (forTrack !== track) return;   // the track changed while LUNA answered
   const check = L.groupTakeCheck(session, forTrack, found);
@@ -350,6 +351,23 @@ async function gather() {
     for (const piece of L.piecesOf(lane)) {
       if (piece.stop <= view.start || piece.start >= view.end) continue;
       const clip = piece.clip, a = Math.max(piece.start, view.start), b = Math.min(piece.stop, view.end);
+      if (clip.clipType.value === 'midi') {
+        // Notes instead of a waveform: those the clip plays (note-on inside it), cut to what shows,
+        // scaled to the pitch range of the clip's whole table so every piece of a take agrees.
+        await clip.midi.ready();
+        if (ticket !== gatherTicket) return;
+        const base = clip.start.value, end = clip.stop.value, all = clip.midi.notes.items;
+        let lo = 127, hi = 0;
+        for (const n of all) { lo = Math.min(lo, n.pitch); hi = Math.max(hi, n.pitch); }
+        const notes = [];
+        for (const n of all) {
+          const on = base + n.startTick, off = base + (n.stopTick ?? end - base);
+          if (on < base || on >= end || on >= b || off <= a) continue;
+          notes.push({ a: Math.max(a, on), z: Math.min(b, off, end), pitch: n.pitch, on });
+        }
+        out.push({ start: a, stop: b, notes, lo, hi });
+        continue;
+      }
       const audio = session.sources && Luna.clipAudio(clip, session.sources);
       if (!audio) { out.push({ start: a, stop: b, outline: true }); continue; }
       const px0 = Math.floor(x(a)), px1 = Math.ceil(x(b));
@@ -392,6 +410,17 @@ function barLines() {
 }
 
 function drawPiece(ctx, p, top, h, color) {
+  if (p.notes) {
+    const span = p.hi - p.lo, rowH = Math.max(1.5, Math.min(4, h / Math.max(1, span + 1)));
+    ctx.fillStyle = color;
+    for (const n of p.notes) {
+      const xa = Math.max(GUTTER, x(n.a)), xb = Math.min(widthCss(), x(n.z));
+      if (xb - xa < 0.5) continue;
+      const y = top + (h - rowH) * (span > 0 ? 1 - (n.pitch - p.lo) / span : 0.5);
+      ctx.fillRect(xa, y, Math.max(1, xb - xa - 0.5), rowH);
+    }
+    return;
+  }
   if (p.outline) {
     const a = Math.max(GUTTER, x(p.start)), b = Math.min(widthCss(), x(p.stop));
     ctx.strokeStyle = color;
@@ -558,11 +587,17 @@ function paintTop(grid) {
   const top = RULER_H, h = COMP_H, list = shownSegments();
   ctx.fillStyle = UI.lane;
   ctx.fillRect(GUTTER, top, W - GUTTER, h);
-  for (const s of list) drawClip(ctx, s.start, s.stop, top + 1, h - 2, clipColors(s.take), nameOf(s.take), scene?.lanes.get(s.take) ?? []);
+  const midi = L.isMidiTrack(track);
+  for (const s of list) {
+    // A MIDI section plays only the notes that start inside it, so the comp row shows only those.
+    const pieces = (scene?.lanes.get(s.take) ?? []).map((p) => (p.notes ? { ...p, notes: p.notes.filter((n) => n.on >= s.start && n.on < s.stop) } : p));
+    drawClip(ctx, s.start, s.stop, top + 1, h - 2, clipColors(s.take), nameOf(s.take), pieces);
+  }
   drawGrid(ctx, grid, top, h);
-  // A crossfade at each seam, drawn as LUNA draws one: an X across the join.
+  // A crossfade at each seam, drawn as LUNA draws one: an X across the join (audio only: LUNA
+  // fades no MIDI clip).
   ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
-  for (const [i, s] of list.entries()) {
+  for (const [i, s] of (midi ? [] : list).entries()) {
     const next = list[i + 1];
     if (!next || next.start !== s.stop) continue;
     const sx = Math.round(x(s.stop)) + 0.5;
@@ -1484,6 +1519,10 @@ function bindClipProps() {
   release(clipOffs);
   for (const lane of compLane ? [compLane, ...takes] : takes) {
     for (const clip of lane.clips.items) {
+      if (clip.clipType.value === 'midi') {
+        const offs = clipOffs;   // notes edited in LUNA redraw the take
+        void clip.midi.ready().then(() => { if (offs === clipOffs) clipOffs.push(clip.midi.notes.onChange(scheduleGather)); }, () => {});
+      }
       for (const prop of [clip.start, clip.stop, clip.sourceStart, clip.layer, clip.gain, clip.renderSourceUid]) clipOffs.push(prop.onChange(scheduleGather));
       if (lane === compLane) clipOffs.push(clip.name.onChange(scheduleNotice));
     }
@@ -1517,6 +1556,7 @@ async function bindTrack(id, refit) {
   // The crossfade length this track's comp was built with (10 ms for a comp built before the
   // page saved it, which is what those were built with unless the box was changed).
   if (track.id !== fadeShownFor) { $('fade').value = String(L.savedFadeMs(session, track) ?? 10); fadeShownFor = track.id; }
+  $('fadeBox').hidden = L.isMidiTrack(track);   // LUNA fades audio clips only
   segments = L.prune(L.savedSegments(session, track), takes.map((p) => p.id));
   const saved = L.store(session).value(track.id, 'segments');
   trackOffs.push(saved.onChange(() => {
