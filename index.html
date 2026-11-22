@@ -49,6 +49,17 @@
     #groupBox { color: #F7C449; }
     #groupBox.off { color: #c9b06a; cursor: help; }
     #groupBox.off input { opacity: 0.5; }
+    #groupBlock { flex: 1; overflow-y: auto; padding: 40px 48px; background: var(--bg); }
+    #groupBlock[hidden] { display: none; }
+    #groupBlock .card { max-width: 640px; background: #262019; border: 1px solid #5a4a1c; border-left: 6px solid var(--accent); border-radius: 6px; padding: 22px 26px; line-height: 1.5; }
+    #groupBlock h2 { margin: 0 0 10px; font-size: 17px; color: #f3d98b; }
+    #groupBlock p { margin: 8px 0; }
+    #groupBlock table { border-collapse: collapse; margin: 10px 0 14px; }
+    #groupBlock td { padding: 3px 18px 3px 0; border-bottom: 1px solid #3a3226; }
+    #groupBlock td:last-child { color: #f3d98b; text-align: right; }
+    #groupBlock ol { margin: 6px 0 10px; padding-left: 22px; }
+    #groupBlock li { margin: 6px 0; }
+    #groupBlock .dim { color: var(--dim); }
     #notice { display: none; align-items: center; gap: 10px; padding: 6px 12px; background: #3a2f12; color: #f3d98b; border-bottom: 1px solid #5a4a1c; }
     #notice button { font: inherit; background: #F7C449; color: #000; border: 0; border-radius: 6px; padding: 3px 10px; cursor: pointer; }
     #notice button.secondary { background: transparent; color: #f3d98b; border: 1px solid #8a7330; }
@@ -93,9 +104,20 @@
     <div id="tidyList"></div>
     <div class="tidyFoot"><button id="tidyGo">Apply</button><button id="tidyClose" class="secondary">Close</button></div>
   </div>
+  <div id="groupBlock" hidden><div class="card">
+    <h2 id="blockTitle">This track can't be comped yet</h2>
+    <p id="blockWhy"></p>
+    <table id="blockCounts"></table>
+    <p>To comp, do one of these in LUNA:</p>
+    <ol>
+      <li>Give every track in the group the same number of takes: record the missing passes, or delete takes you don't need. An empty New Version doesn't count.</li>
+      <li>Or turn off Edit for <span id="blockGroup">the group</span>, or switch the group off. Then you can comp one track at a time, or still choose to comp the group together once the takes match.</li>
+    </ol>
+    <p class="dim">This page updates by itself when you do.</p>
+  </div></div>
   <div id="top" class="stage"><canvas id="topCanvas"></canvas><div class="playhead" id="ph1" hidden></div><button id="raise" hidden title="SwipeComp is below newer takes in LUNA's playlist list. Move it to the top, and keep it there as you comp.">↑ Move to top</button></div>
   <div id="scroller"><div class="stage"><canvas id="takesCanvas"></canvas><div class="playhead" id="ph2" hidden></div><input id="rename" type="text" hidden spellcheck="false" autocomplete="off"></div><div id="empty"></div></div>
-  <footer>Space or ▶ Play plays and stops. Drag across a take to use it there. Drag a lit section's edge, or a seam in the comp, to move it. Fill gaps from fills the comp's silent gaps with one take. Tidy lists tiny gaps and scraps left by swipes. Snap uses LUNA's own grid. Click a take to switch the comp section under the pointer to it. Swipe across Silence (under the comp) to erase that stretch, or click it to erase the section above; Option-drag on a take does the same. Click a take's name to hear it alone, and Comp to hear the comp. Double-click a take's name to rename it. Comping a group, the grouped tracks show below this track's takes: click one's name to show or hide its takes (swipe on them too), double-click it to work on that track. Click the ruler to move the playhead. LUNA's markers show above the bar numbers; click one to go there. Cmd+scroll zooms, sideways scroll moves along.</footer>
+  <footer>Space or ▶ Play plays and stops. Drag across a take to use it there. Drag a lit section's edge, or a seam in the comp, to move it. Fill gaps from fills the comp's silent gaps with one take. Tidy lists tiny gaps and scraps left by swipes. Snap uses LUNA's own grid. Click a take to switch the comp section under the pointer to it. Swipe across Silence (under the comp) to erase that stretch, or click it to erase the section above; Option-drag on a take does the same. Click a take's name to hear it alone, and Comp to hear the comp. Double-click a take's name to rename it. In a LUNA group with Edit on, the tracks comp only together, and only when each has the same number of takes; in a group without it, the page asks whether to comp the group or this track alone. Comping a group, the grouped tracks show below this track's takes: click one's name to show or hide its takes (swipe on them too), double-click it to work on that track. Click the ruler to move the playhead. LUNA's markers show above the bar numbers; click one to go there. Cmd+scroll zooms, sideways scroll moves along.</footer>
   <script src="vendor/luna.global.js"></script>
   <script src="logic.js"></script>
   <script src="main.js"></script>

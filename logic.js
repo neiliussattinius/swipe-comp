@@ -748,25 +748,59 @@ const AddOnLogic = {
     }
   },
 
-  /** The names of the switched-on groups `track` is in (for showing), from LUNA's group list. */
-  async groupNames(session, track) {
+  /**
+   * Every LUNA group `track` is in, switched on or not, from LUNA's group list:
+   * `[{ uid, name, on, edit, trackIds }]`. `on`: switched on (in the edit context's group
+   * selection); `edit`: Edit among its attributes; `trackIds`: its other members. [] when LUNA
+   * cannot say.
+   */
+  async groupsOf(session, track) {
     try {
       const raw = session.client.raw, at = session.path;
       const sel = JSON.parse((await raw.get(`${at}/contexts/main/selection_groups`))?.value ?? '[]');
       const groups = await raw.get(`${at}/groups`, { levels: 4 });   // group, members, member, its properties
-      const out = [];
-      for (const g of groups?.children ?? []) {
-        const uid = g.properties?.uid?.value;
-        if (!Array.isArray(sel) || !sel.includes(uid)) continue;
-        // Only groups with Edit among their attributes comp together (as groupMates asks LUNA).
-        if (!String(g.properties?.group_attributes?.value ?? '').split(',').map((a) => a.trim()).includes('edit')) continue;
-        const members = g.children?.find((c) => c.path === 'members')?.children ?? [];
-        if (members.some((m) => m.properties?.track_uid?.value === track.id)) out.push(g.properties?.name?.value ?? 'group');
-      }
-      return out;
+      return AddOnLogic.readGroups(groups, sel, track.id);
     } catch {
       return [];
     }
+  },
+
+  /** groupsOf's reading of LUNA's `/groups` node (`levels: 4`) and group selection, for one track. */
+  readGroups(node, selection, trackId) {
+    const out = [];
+    for (const g of node?.children ?? []) {
+      const ids = (g.children?.find((c) => c.path === 'members')?.children ?? [])
+        .map((m) => m.properties?.track_uid?.value).filter(Boolean);
+      if (!ids.includes(trackId)) continue;
+      const uid = g.properties?.uid?.value;
+      out.push({
+        uid,
+        name: g.properties?.name?.value ?? 'group',
+        on: Array.isArray(selection) && selection.includes(uid),
+        edit: String(g.properties?.group_attributes?.value ?? '').split(',').map((a) => a.trim()).includes('edit'),
+        trackIds: ids.filter((id) => id !== trackId),
+      });
+    }
+    return out;
+  },
+
+  /**
+   * How a track's groups comp (his rules, 11/21 night):
+   * - `'edit'`: LUNA links edits across the group (switched on, Edit ticked), so its tracks comp
+   *   only together, never one alone. `lunaIds` is LUNA's own answer (groupMates), used first.
+   * - `'ask'`: the track is only in groups that don't link edits (switched off, or no Edit): the
+   *   user chooses between comping the group together and this track alone.
+   * - `'none'`: in no group with other tracks.
+   * `{ mode, trackIds, names }`: the tracks that would comp with it, and the groups' names.
+   */
+  groupPlan(groups, lunaIds = []) {
+    const linked = groups.filter((g) => g.on && g.edit);
+    if (lunaIds.length || linked.length) {
+      const ids = lunaIds.length ? lunaIds : [...new Set(linked.flatMap((g) => g.trackIds))];
+      return { mode: 'edit', trackIds: ids, names: linked.map((g) => g.name) };
+    }
+    const ids = [...new Set(groups.flatMap((g) => g.trackIds))];
+    return ids.length ? { mode: 'ask', trackIds: ids, names: groups.filter((g) => g.trackIds.length).map((g) => g.name) } : { mode: 'none', trackIds: [], names: [] };
   },
 
   /** A take's first clip (by start), or undefined for an empty take. */
@@ -786,7 +820,9 @@ const AddOnLogic = {
    * of recorded takes (an empty take is not counted). `{ lead, counts: [{ track, count }], same }`,
    * `lead` being `lead`'s own count. When `same` is false the page comps no grouped track, not
    * even the ones whose counts agree: comping some of a drum kit's mics and not others would
-   * pull the kit apart. (From 11/21 afternoon until that night it comped the agreeing ones.)
+   * pull the kit apart. In an edit group the page then comps nothing at all and says how to fix
+   * it; otherwise this track comps alone. (From 11/21 afternoon until that night it comped the
+   * agreeing ones.)
    */
   groupTakeCheck(session, lead, others) {
     const n = AddOnLogic.recordedTakes(session, lead).length;

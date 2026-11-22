@@ -375,6 +375,29 @@ describe('comping an edit group', () => {
     expect(check.counts.map((c) => c.count)).toEqual([4]);
   });
 
+  it("reads LUNA's group list: which groups the track is in, switched on or not, with Edit or not", () => {
+    const group = (uid, name, attrs, ids) => ({
+      properties: { uid: { value: uid }, name: { value: name }, group_attributes: { value: attrs } },
+      children: [{ path: 'members', children: ids.map((id) => ({ properties: { track_uid: { value: id } } })) }],
+    });
+    const node = { children: [group('g1', 'Drums', 'edit,mix', ['k', 's', 'oh']), group('g2', 'Vox', 'mix', ['v1', 'v2']), group('g3', 'All', 'edit', ['k', 'v1'])] };
+    expect(L.readGroups(node, ['g1'], 'k')).toEqual([
+      { uid: 'g1', name: 'Drums', on: true, edit: true, trackIds: ['s', 'oh'] },
+      { uid: 'g3', name: 'All', on: false, edit: true, trackIds: ['v1'] },
+    ]);
+    expect(L.readGroups(node, ['g1'], 'nobody')).toEqual([]);
+  });
+
+  it('comps a group with Edit on only together, and asks about a group without it', () => {
+    const g = (on, edit, trackIds, name = 'G') => ({ uid: name, name, on, edit, trackIds });
+    expect(L.groupPlan([g(true, true, ['a', 'b'], 'Drums')], ['a', 'b'])).toEqual({ mode: 'edit', trackIds: ['a', 'b'], names: ['Drums'] });
+    // LUNA's answer first; the group list when LUNA gives none.
+    expect(L.groupPlan([g(true, true, ['a'], 'Drums')], [])).toEqual({ mode: 'edit', trackIds: ['a'], names: ['Drums'] });
+    // Switched off, or switched on without Edit: the user chooses.
+    expect(L.groupPlan([g(false, true, ['a'], 'BGVs'), g(true, false, ['b', 'a'], 'Mix')], [])).toEqual({ mode: 'ask', trackIds: ['a', 'b'], names: ['BGVs', 'Mix'] });
+    expect(L.groupPlan([], [])).toEqual({ mode: 'none', trackIds: [], names: [] });
+  });
+
   it('builds the same sections on every grouped track from its own takes, as one undo step', async () => {
     const { engine, session, di, amp } = await groupSession();
     const diComp = await L.ensureCompLane(session, di);

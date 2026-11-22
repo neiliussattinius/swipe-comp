@@ -52,46 +52,75 @@ function summary() {
   return `${base} · with ${mates.length} grouped track${mates.length === 1 ? '' : 's'}${gaps.length ? ` (${gaps.join('; ')})` : ''}`;
 }
 
-/** Why the group can't comp together, as "comping this track alone: ... (this track 3, Room 2, Overheads 3)". */
+/** Why the group can't comp together, with every track's take count. */
 function unevenNote() {
   if (!uneven.length) return '';
   const counts = [`this track ${leadTakeCount}`, ...uneven.map((m) => `${m.track.name.value} ${m.count}`)];
-  return `comping this track alone: grouped tracks comp together only when each has the same number of takes (${counts.join(', ')})`;
+  return groupMode === 'edit'
+    ? `can't comp: ${groupName()} has Edit on, and its tracks' takes don't match (${counts.join(', ')})`
+    : `comping this track alone: grouped tracks comp together only when each has the same number of takes (${counts.join(', ')})`;
 }
 
-// ── comping an edit group ───────────────────────────────────────────────────────────────
-// When the track is in a LUNA edit group that is switched on, the page can comp the group's
-// tracks together, as Logic does with a group's Editing on: the same sections on every track,
-// each from its own matching take. `mates` are the group's other comp-able tracks.
+// ── comping a group ─────────────────────────────────────────────────────────────────────
+// His rules (11/21 night): when LUNA links edits across the track's group (switched on, Edit
+// ticked), its tracks comp only together, as Logic does with a group's Editing on: the same
+// sections on every track, each from its own matching take. When the track is in a group that
+// doesn't link edits (switched off, or no Edit), the page asks whether to comp the group
+// together or this track alone. Either way the tracks comp together only when each has the same
+// number of takes (Logic's rule); in a linked group that doesn't, the page comps nothing and
+// says how to fix it. `mates` are the group's other comp-able tracks.
 let mates = [];          // [{ track, lane, map }]: map = this track's take id -> the mate's take id
-let uneven = [];         // [{ track, count }]: every grouped track, when their take counts don't all agree (Logic's rule: then no group comp)
+let uneven = [];         // [{ track, count }]: every grouped track, when their take counts don't all agree
 let leadTakeCount = 0;
 let groupOffs = [];
-let groupWanted = true;  // the header's "Comp the group" box
+let groupMode = 'none';  // 'edit' (LUNA links edits: comp only together), 'ask' (the user chooses), 'none'
+let groupKey = '';       // the group's tracks (ids, sorted): where the 'ask' answer is kept
 let groupNamesShown = [];
-const groupActive = () => groupWanted && mates.length > 0;
+const groupName = () => (groupNamesShown.length ? groupNamesShown.join(' + ') : 'the group');
+
+// The answers to "comp the group together, or this track alone?", per set of grouped tracks
+// (true: together). Kept in this browser only; without them the page asks again.
+const CHOICE_KEY = 'com.neilsattin.swipe_comp.groupChoice';
+let groupChoices = {};
+try { groupChoices = JSON.parse(localStorage.getItem(CHOICE_KEY) ?? '{}') ?? {}; } catch { groupChoices = {}; }
+function chooseGroup(together) {
+  groupChoices[groupKey] = together;
+  try { localStorage.setItem(CHOICE_KEY, JSON.stringify(groupChoices)); } catch { /* asked again next time */ }
+  afterGroupChange();
+}
+const groupActive = () => mates.length > 0 && (groupMode === 'edit' || groupChoices[groupKey] === true);
+/** A linked group whose takes don't match: the page comps nothing until that's fixed. */
+const groupBlocked = () => groupMode === 'edit' && uneven.length > 0;
 
 // The group view, as in Logic: comping a group, the takes area shows this track's takes, then
 // each grouped track as a header row with its comp, followed by its takes when opened (click the
 // header to open or close it). A swipe on any track's take comps the whole group: the comp list
 // is kept in this track's take ids, and a grouped track's take stands for the take it matches.
+// A dark band above each grouped track's header row marks where the previous track's takes end.
+const GROUP_GAP = 14;
 let opened = new Set();   // grouped tracks shown open (track ids); closed by default
-/** The rows of the takes area: { kind: 'take', track, take, lead } or { kind: 'mate', mate }. */
+/** The rows of the takes area, each with its `top`: { kind: 'take', track, take, lead } or { kind: 'mate', mate, gap }. */
 function rowsOf() {
   const rows = takes.map((take) => ({ kind: 'take', track, take, lead: take }));
-  if (!groupActive()) return rows;
-  for (const m of mates) {
-    rows.push({ kind: 'mate', mate: m });
-    if (!opened.has(m.track.id)) continue;
-    for (const lead of takes) {
-      const take = session.playlists.byId(m.map.get(lead.id));
-      if (take) rows.push({ kind: 'take', track: m.track, take, lead, mate: m });
+  if (groupActive()) {
+    for (const m of mates) {
+      rows.push({ kind: 'mate', mate: m, gap: GROUP_GAP });
+      if (!opened.has(m.track.id)) continue;
+      for (const lead of takes) {
+        const take = session.playlists.byId(m.map.get(lead.id));
+        if (take) rows.push({ kind: 'take', track: m.track, take, lead, mate: m });
+      }
     }
   }
+  let y = 0;
+  for (const r of rows) { y += r.gap ?? 0; r.top = y; y += LANE_H; }
   return rows;
 }
-const rowIndexAt = (e) => Math.floor(localY(e, takesCanvas) / LANE_H);
-const rowAt = (e) => rowsOf()[rowIndexAt(e)];
+const rowsHeight = (rows) => (rows.length ? rows[rows.length - 1].top + LANE_H : 0);
+function rowAt(e) {
+  const y = localY(e, takesCanvas);
+  return rowsOf().find((r) => y >= r.top && y < r.top + LANE_H);   // undefined in a band between tracks
+}
 
 /** Mates with no matching take for a take the comp uses, as "BGV 2: no match for T5". */
 function groupGaps() {
@@ -104,29 +133,36 @@ function groupGaps() {
 
 async function refreshGroup() {
   const forTrack = track;
-  if (!session || !forTrack) { mates = []; uneven = []; paintGroup(); return; }
-  const found = (await L.groupMates(session, forTrack))
-    .filter((t) => t.trackType.value === 'audio');
+  if (!session || !forTrack) { mates = []; uneven = []; groupMode = 'none'; afterGroupChange(); return; }
+  const [linked, groups] = await Promise.all([L.groupMates(session, forTrack), L.groupsOf(session, forTrack)]);
+  const plan = L.groupPlan(groups, linked.map((t) => t.id));
+  const found = plan.trackIds.map((id) => session.tracks.byId(id)).filter((t) => t && t.trackType.value === 'audio');
   for (const t of found) await Promise.all(L.playlistsOf(session, t).map((p) => p.clips.load()));
-  const names = found.length ? await L.groupNames(session, forTrack) : [];
   if (forTrack !== track) return;   // the track changed while LUNA answered
-  // Logic's rule: grouped tracks comp together only when every one has the same number of takes;
-  // otherwise none of them does, and this track comps alone.
   const check = L.groupTakeCheck(session, forTrack, found);
+  groupMode = found.length ? plan.mode : 'none';
+  groupKey = [forTrack.id, ...found.map((t) => t.id)].sort().join(',');
+  groupNamesShown = plan.names;
   leadTakeCount = check.lead;
   uneven = check.same ? [] : check.counts;
   mates = check.same ? found.map((t) => ({ track: t, lane: L.compLaneOf(session, t), map: L.matchTakes(session, forTrack, t) })) : [];
-  groupNamesShown = names;
   release(groupOffs);
   for (const m of mates) groupOffs.push(m.track.playlistUid.onChange(scheduleNotice));
+  // A grouped track's take getting (or losing) its recording changes the counts the rule checks.
+  for (const t of found) for (const p of L.takesOf(session, t)) groupOffs.push(p.clips.onChange(scheduleGroup));
+  afterGroupChange();
+}
+/** Repaint everything the group's state shows, and fetch grouped tracks' waveforms when they're newly shown. */
+function afterGroupChange() {
   paintGroup();
+  paintBlock();
   if (!busy) setStatus(summary());
   paintNotice();
   scheduleGather();   // the grouped tracks' rows need their takes' waveforms
   schedulePaint();
-  // Ask for missing waveforms when the grouped tracks change (not on every refresh: each check asks LUNA per take).
-  const sig = `${forTrack.id}:${mates.map((m) => m.track.id).join(',')}`;
-  if (sig !== matesSeen && mates.length && groupWanted && !session.transport.playing.value) { matesSeen = sig; void drawMissingWaveforms(); }
+  // Ask for missing waveforms when the grouped tracks shown change (not on every refresh: each check asks LUNA per take).
+  const sig = groupActive() ? `${track?.id}:${mates.map((m) => m.track.id).join(',')}` : '';
+  if (sig && sig !== matesSeen && session && !session.transport.playing.value) { matesSeen = sig; void drawMissingWaveforms(); }
 }
 let matesSeen = '';
 let groupTimer;
@@ -134,25 +170,55 @@ function scheduleGroup() {
   clearTimeout(groupTimer);
   groupTimer = setTimeout(() => void refreshGroup(), 250);
 }
+const countsOf = () => [[track, leadTakeCount], ...uneven.map((m) => [m.track, m.count])];
+const takesWord = (c) => `${c} take${c === 1 ? '' : 's'}`;
 function paintGroup() {
   const box = $('groupBox'), label = $('groupLabel'), on = $('groupOn');
-  box.hidden = mates.length === 0 && uneven.length === 0;
-  const name = groupNamesShown.length ? groupNamesShown.join(' + ') : 'edit group';
-  const off = uneven.length > 0;
+  box.hidden = groupMode === 'none';
+  const name = groupName(), off = uneven.length > 0, n = mates.length + 1;
   box.classList.toggle('off', off);
+  on.hidden = groupMode === 'edit';      // a linked group has nothing to choose
   on.disabled = off;
-  on.checked = groupWanted && !off;
-  if (off) {
+  on.checked = groupActive();
+  const counts = countsOf().map(([t, c]) => `${t?.name.value}: ${takesWord(c)}`).join('\n');
+  if (groupMode === 'edit' && off) {
+    label.textContent = `Can't comp ${name}: takes don't match`;
+    box.title = `See below for how to fix it.\n\n${counts}`;
+  } else if (groupMode === 'edit') {
+    label.textContent = `Comping the group (${name}: ${n} tracks)`;
+    box.title = `${name} has Edit on in LUNA, so its tracks comp only together: the same sections on ${[track, ...mates.map((m) => m.track)].map((t) => t?.name.value).join(', ')}, each from its own matching take, as one undo step.\n\nTo comp one track on its own, turn off Edit for the group in LUNA, or switch the group off.`;
+  } else if (off) {
     label.textContent = `Group comp off (${name}): takes don't match`;
-    const counts = [[track, leadTakeCount], ...uneven.map((m) => [m.track, m.count])]
-      .map(([t, c]) => `${t?.name.value}: ${c} take${c === 1 ? '' : 's'}`).join('\n');
     box.title = `Grouped tracks comp together only when each has the same number of takes, as in Logic, so take 1 goes with take 1 on every track.\n\n${counts}\n\nSwipes here comp ${track?.name.value} alone. To comp the group, give every track the same number of takes in LUNA (record the missing pass, or delete the extra take).`;
   } else {
-    label.textContent = `Comp the group (${name}: ${mates.length + 1} tracks)`;
-    box.title = `Comp ${[track, ...mates.map((m) => m.track)].map((t) => t?.name.value).join(', ')} together: the same sections on each, from each track's matching take, as one undo step.`;
+    label.textContent = `Comp the group (${name}: ${n} tracks)`;
+    box.title = `Edit is off for ${name} in LUNA, so this is your choice. Ticked: comp ${[track, ...mates.map((m) => m.track)].map((t) => t?.name.value).join(', ')} together, the same sections on each, from each track's matching take, as one undo step. Unticked: comp ${track?.name.value} alone.`;
   }
 }
-$('groupOn').onchange = () => { groupWanted = $('groupOn').checked; setStatus(summary()); paintNotice(); scheduleGather(); schedulePaint(); };
+$('groupOn').onchange = () => { if (groupMode === 'ask') chooseGroup($('groupOn').checked); };
+
+// A linked group whose takes don't match: the whole page says what to do instead of showing takes.
+const COMP_CONTROLS = ['base', 'fade', 'clear', 'tidy'];
+function paintBlock() {
+  const blocked = !!(session && track && groupBlocked());
+  $('groupBlock').hidden = !blocked;
+  $('top').style.display = $('scroller').style.display = blocked ? 'none' : '';
+  for (const id of COMP_CONTROLS) $(id).disabled = blocked;
+  if (!blocked) return;
+  $('blockTitle').textContent = `${track.name.value} can't be comped yet`;
+  $('blockWhy').textContent = `It's in ${groupName()}, a group with Edit on in LUNA, so its tracks can only be comped together. Grouped tracks comp together only when each has the same number of takes, so that take 1 goes with take 1 on every track. Right now they don't match:`;
+  const table = $('blockCounts');
+  table.replaceChildren(...countsOf().map(([t, c], i) => {
+    const tr = document.createElement('tr');
+    for (const text of [`${t?.name.value ?? ''}${i === 0 ? ' (this track)' : ''}`, takesWord(c)]) {
+      const td = document.createElement('td');
+      td.textContent = text;
+      tr.append(td);
+    }
+    return tr;
+  }));
+  $('blockGroup').textContent = groupName();
+}
 
 /** Play `lane` on this track and, comping a group, the matching take (or comp) on each mate. */
 async function playEverywhere(lane) {
@@ -659,13 +725,22 @@ function paintMateRow(ctx, m, top, grid, list, W) {
 
 function paintTakes(grid) {
   const rows = session && track ? rowsOf() : [];
-  const H = Math.max(1, rows.length * LANE_H), ctx = sizeCanvas($('takesCanvas'), H), W = widthCss();
+  const H = Math.max(1, rowsHeight(rows)), ctx = sizeCanvas($('takesCanvas'), H), W = widthCss();
   ctx.clearRect(0, 0, W, H);
   if (!session || !track) return;
   const list = shownSegments(), group = groupActive();
-  rows.forEach((row, i) => {
-    const top = i * LANE_H;
-    if (row.kind === 'mate') { paintMateRow(ctx, row.mate, top, grid, list, W); return; }
+  rows.forEach((row) => {
+    const top = row.top;
+    if (row.kind === 'mate') {
+      // The band between the previous track's takes and this track: dark, ruled in the track's colour.
+      const tc = row.mate.track.color?.value, color = tc && (tc >>> 24) ? L.argbCss(tc) : '#8a8a8a';
+      ctx.fillStyle = '#0c0c0c';
+      ctx.fillRect(0, top - row.gap, W, row.gap);
+      ctx.fillStyle = color;
+      ctx.fillRect(0, top - 3, W, 3);
+      paintMateRow(ctx, row.mate, top, grid, list, W);
+      return;
+    }
     const { take, lead } = row, pieces = scene?.lanes.get(take.id) ?? [], name = take.name.value ?? `Take ${take.version.value}`;
     ctx.fillStyle = UI.lane;
     ctx.fillRect(GUTTER, top, W - GUTTER, LANE_H);
@@ -721,7 +796,7 @@ const current = () => pending ?? segments;
 const sameList = (a, b) => JSON.stringify(L.merge(a)) === JSON.stringify(L.merge(b));
 
 async function commit(next, force = false, replaceForeign = false) {
-  if (busy) return;
+  if (busy || groupBlocked()) return;   // a linked group whose takes don't match comps nothing
   if (!force && sameList(next, current())) { schedulePaint(); return; }
   // Clips on the comp that the page did not put there (a recording, an edit made in LUNA) would
   // be replaced by this rebuild: hold the change and ask first.
@@ -961,16 +1036,16 @@ takesCanvas.addEventListener('click', (e) => {
 takesCanvas.addEventListener('dblclick', (e) => {
   if (!track || localX(e, takesCanvas) >= GUTTER) return;
   clearTimeout(nameClickTimer);
-  const i = rowIndexAt(e), row = rowsOf()[i];
+  const row = rowAt(e);
   if (!row) return;
   if (row.kind === 'mate') { if (!busy) void bindTrack(row.mate.track.id, false); return; }
-  startRename(row.lead, i);
+  startRename(row.lead, row.top);
 });
 
-function startRename(take, row) {
+function startRename(take, top) {
   const input = $('rename');
   input.value = take.name.value ?? '';
-  input.style.top = `${row * LANE_H + 2}px`;
+  input.style.top = `${top + 2}px`;
   input.style.width = `${GUTTER - 14}px`;
   input.hidden = false;
   input.focus();
@@ -1111,6 +1186,14 @@ function paintNotice() {
       noticeFix = () => commit(next, true, true);
       altLabel = 'Cancel my change';
       noticeAlt = () => { held = undefined; paintNotice(); schedulePaint(); };
+    } else if (groupMode === 'ask' && mates.length && groupChoices[groupKey] === undefined) {
+      // In a group that doesn't link edits: ask once (per set of tracks) whether to comp it together.
+      const n = mates.length;
+      text = `${track.name.value} is in ${groupName()} with ${n} other track${n === 1 ? '' : 's'}, but its edit grouping is off in LUNA. Comp the whole group together, or just this track?`;
+      fixLabel = `Comp the group (${n + 1} tracks)`;
+      noticeFix = () => chooseGroup(true);
+      altLabel = 'Just this track';
+      noticeAlt = () => chooseGroup(false);
     } else if (!compLane && segments.length) {
       text = `The ${L.COMP_NAME} playlist is gone (deleted in LUNA?). Your ${segments.length} comp section${segments.length === 1 ? ' is' : 's are'} still saved.`;
       fixLabel = 'Rebuild it';

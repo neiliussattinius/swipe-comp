@@ -49,26 +49,28 @@ installed Add On shows in the menu.
 
 ## Grouped tracks
 
-When the track is in a LUNA group that is switched on and has Edit ticked, a "Comp the group"
-box appears in the header. With it on, every change makes the same sections on each grouped
-audio track, each from its own matching take, crossfaded at the same points, as one undo step.
-A drum kit's mics, or a bass DI and amp, stay together.
+When the track is in a LUNA group that is switched on and has Edit ticked, its tracks comp only
+together, never one alone: every change makes the same sections on each grouped audio track,
+each from its own matching take, crossfaded at the same points, as one undo step. A drum kit's
+mics, or a bass DI and amp, stay together. When the track is in a group without that (switched
+off, or Edit not ticked), Swipe Comp asks once whether to comp the group together or just this
+track; the "Comp the group" box in the header changes the answer.
 
 As in Logic, grouped tracks comp together only when they have the same number of takes, and
 take 1 goes with take 1, take 2 with take 2, and so on. Take 1 has the same colour on every
-track, take 2 another. If any grouped track has a different number of takes, the group doesn't
-comp together at all: the box reads "Group comp off", its tooltip lists each track's count, and
-swipes comp only the track you're on, so a kit's mics never end up on different takes. An empty
-New Version is not counted. Clicking a take's name plays that take
-on every grouped track, and renaming a take renames its match on each one.
+track, take 2 another. An empty New Version is not counted. In a group with Edit on whose takes
+don't match, Swipe Comp shows what to fix instead of the takes: give every track the same number
+of takes, or turn off Edit for the group to comp one track at a time. In a group without Edit
+whose takes don't match, it comps only the track you're on. Clicking a take's name plays that
+take on every grouped track, and renaming a take renames its match on each one.
 
-Comping a group, the grouped tracks show below this track's takes, as in Logic: each as a
-header row with its own comp, drawn from its own recording. Click a grouped track's name to
-show or hide its takes; you can swipe on those too, and the whole group follows. Double-click
+Comping a group, the grouped tracks show below this track's takes, as in Logic, each after a
+dark band in its track colour: a header row with its own comp, drawn from its own recording.
+Click a grouped track's name to show or hide its takes; you can swipe on those too, and the whole group follows. Double-click
 it to make it the track you're working on.
 
-Group comping has been tested against the SDK's simulated LUNA only, not yet on a real
-recorded group. Reports welcome.
+Group comping has been tried in LUNA on a group made from a copied track, not yet on a group
+recorded together (a drum kit, say). Reports welcome.
 
 ## Things to know
 
