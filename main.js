@@ -1677,7 +1677,20 @@ async function connect() {
     }
   }
   // LUNA's undo, redo, play and record keys keep working while this page has the focus.
-  Luna.bindShortcuts(luna);
+  const keys = Luna.bindShortcuts(luna);
+  // Inside LUNA the page leaves keys to LUNA (bindShortcuts installs nothing there). But once the
+  // takes area has been clicked (a take's name, say) and has takes to scroll through, the web view
+  // uses Space to scroll it, and LUNA never sees the key: Space did nothing until Play was clicked
+  // (seen in LUNA 3.1.2). So inside LUNA the page takes Space itself and plays or stops, as Play does.
+  if (!keys.installed) {
+    window.addEventListener('keydown', (e) => {
+      if (e.key !== ' ' || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+      const el = e.target;
+      if ((el instanceof HTMLInputElement && el.type !== 'checkbox') || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return;
+      e.preventDefault();
+      $('play').onclick();
+    });
+  }
   await luna.sessions.ready();
   const rebind = () => bindSession().catch((e) => setStatus(`Could not read the session: ${e.message ?? e}`, 'error'));
   luna.sessions.focused.onChange(rebind);
