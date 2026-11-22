@@ -359,11 +359,20 @@ describe('comping an edit group', () => {
     expect([...map.entries()]).toEqual(d.map((p, i) => [p.id, a[i].id]));
   });
 
-  it("matches nothing when the tracks' take counts differ (Logic's rule), so that track is left out", async () => {
+  it("matches nothing when the tracks' take counts differ (Logic's rule)", async () => {
     const { session, di, amp } = await groupSession({ recordedAmpTake: true });
     expect(L.recordedTakes(session, di)).toHaveLength(3);
     expect(L.recordedTakes(session, amp)).toHaveLength(4);
     expect(L.matchTakes(session, di, amp).size).toBe(0);
+  });
+
+  it('lets the group comp only when every track has the same number of takes', async () => {
+    const even = await groupSession({ extraAmpTake: true });   // an empty extra take doesn't count
+    expect(L.groupTakeCheck(even.session, even.di, [even.amp])).toEqual({ lead: 3, counts: [{ track: even.amp, count: 3 }], same: true });
+    const odd = await groupSession({ recordedAmpTake: true });
+    const check = L.groupTakeCheck(odd.session, odd.di, [odd.amp]);
+    expect(check.same).toBe(false);
+    expect(check.counts.map((c) => c.count)).toEqual([4]);
   });
 
   it('builds the same sections on every grouped track from its own takes, as one undo step', async () => {

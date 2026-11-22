@@ -45,17 +45,18 @@ function summary() {
   if (!track) return session.name.value ?? '';
   const n = segments.length;
   const base = `${session.name.value} · ${track.name.value}: ${takes.length} take${takes.length === 1 ? '' : 's'} · comp ${n ? `${n} section${n === 1 ? '' : 's'}` : 'empty'}`;
-  const out = leftOutNote();
-  if (!groupActive()) return out ? `${base} · ${out}` : base;
+  const off = unevenNote();
+  if (off) return `${base} · ${off}`;
+  if (!groupActive()) return base;
   const gaps = groupGaps();
-  return `${base} · with ${mates.length} grouped track${mates.length === 1 ? '' : 's'}${gaps.length ? ` (${gaps.join('; ')})` : ''}${out ? ` · ${out}` : ''}`;
+  return `${base} · with ${mates.length} grouped track${mates.length === 1 ? '' : 's'}${gaps.length ? ` (${gaps.join('; ')})` : ''}`;
 }
 
-/** Grouped tracks left out because their take count differs, as "left out of the group comp: Amp has 3 takes, this track 4". */
-function leftOutNote() {
-  if (!groupWanted || !leftOut.length) return '';
-  const n = (c) => `${c} take${c === 1 ? '' : 's'}`;
-  return `left out of the group comp (grouped tracks need the same number of takes): ${leftOut.map((m) => `${m.track.name.value} has ${n(m.count)}`).join(', ')}, this track ${leadTakeCount}`;
+/** Why the group can't comp together, as "comping this track alone: ... (this track 3, Room 2, Overheads 3)". */
+function unevenNote() {
+  if (!uneven.length) return '';
+  const counts = [`this track ${leadTakeCount}`, ...uneven.map((m) => `${m.track.name.value} ${m.count}`)];
+  return `comping this track alone: grouped tracks comp together only when each has the same number of takes (${counts.join(', ')})`;
 }
 
 // ── comping an edit group ───────────────────────────────────────────────────────────────
@@ -63,7 +64,7 @@ function leftOutNote() {
 // tracks together, as Logic does with a group's Editing on: the same sections on every track,
 // each from its own matching take. `mates` are the group's other comp-able tracks.
 let mates = [];          // [{ track, lane, map }]: map = this track's take id -> the mate's take id
-let leftOut = [];        // [{ track, count }]: grouped tracks with a different number of takes (Logic's rule)
+let uneven = [];         // [{ track, count }]: every grouped track, when their take counts don't all agree (Logic's rule: then no group comp)
 let leadTakeCount = 0;
 let groupOffs = [];
 let groupWanted = true;  // the header's "Comp the group" box
@@ -103,18 +104,18 @@ function groupGaps() {
 
 async function refreshGroup() {
   const forTrack = track;
-  if (!session || !forTrack) { mates = []; leftOut = []; paintGroup(); return; }
+  if (!session || !forTrack) { mates = []; uneven = []; paintGroup(); return; }
   const found = (await L.groupMates(session, forTrack))
     .filter((t) => t.trackType.value === 'audio');
   for (const t of found) await Promise.all(L.playlistsOf(session, t).map((p) => p.clips.load()));
   const names = found.length ? await L.groupNames(session, forTrack) : [];
   if (forTrack !== track) return;   // the track changed while LUNA answered
-  // Logic's rule: grouped tracks comp together when they have the same number of takes.
-  leadTakeCount = L.recordedTakes(session, forTrack).length;
-  const counted = found.map((t) => ({ track: t, count: L.recordedTakes(session, t).length }));
-  leftOut = counted.filter((m) => m.count !== leadTakeCount);
-  mates = counted.filter((m) => m.count === leadTakeCount)
-    .map(({ track: t }) => ({ track: t, lane: L.compLaneOf(session, t), map: L.matchTakes(session, forTrack, t) }));
+  // Logic's rule: grouped tracks comp together only when every one has the same number of takes;
+  // otherwise none of them does, and this track comps alone.
+  const check = L.groupTakeCheck(session, forTrack, found);
+  leadTakeCount = check.lead;
+  uneven = check.same ? [] : check.counts;
+  mates = check.same ? found.map((t) => ({ track: t, lane: L.compLaneOf(session, t), map: L.matchTakes(session, forTrack, t) })) : [];
   groupNamesShown = names;
   release(groupOffs);
   for (const m of mates) groupOffs.push(m.track.playlistUid.onChange(scheduleNotice));
@@ -134,12 +135,22 @@ function scheduleGroup() {
   groupTimer = setTimeout(() => void refreshGroup(), 250);
 }
 function paintGroup() {
-  const box = $('groupBox'), label = $('groupLabel');
-  box.hidden = mates.length === 0;
-  $('groupOn').checked = groupWanted;
+  const box = $('groupBox'), label = $('groupLabel'), on = $('groupOn');
+  box.hidden = mates.length === 0 && uneven.length === 0;
   const name = groupNamesShown.length ? groupNamesShown.join(' + ') : 'edit group';
-  label.textContent = `Comp the group (${name}: ${mates.length + 1} tracks)`;
-  box.title = `Comp ${[track, ...mates.map((m) => m.track)].map((t) => t?.name.value).join(', ')} together: the same sections on each, from each track's matching take, as one undo step.`;
+  const off = uneven.length > 0;
+  box.classList.toggle('off', off);
+  on.disabled = off;
+  on.checked = groupWanted && !off;
+  if (off) {
+    label.textContent = `Group comp off (${name}): takes don't match`;
+    const counts = [[track, leadTakeCount], ...uneven.map((m) => [m.track, m.count])]
+      .map(([t, c]) => `${t?.name.value}: ${c} take${c === 1 ? '' : 's'}`).join('\n');
+    box.title = `Grouped tracks comp together only when each has the same number of takes, as in Logic, so take 1 goes with take 1 on every track.\n\n${counts}\n\nSwipes here comp ${track?.name.value} alone. To comp the group, give every track the same number of takes in LUNA (record the missing pass, or delete the extra take).`;
+  } else {
+    label.textContent = `Comp the group (${name}: ${mates.length + 1} tracks)`;
+    box.title = `Comp ${[track, ...mates.map((m) => m.track)].map((t) => t?.name.value).join(', ')} together: the same sections on each, from each track's matching take, as one undo step.`;
+  }
 }
 $('groupOn').onchange = () => { groupWanted = $('groupOn').checked; setStatus(summary()); paintNotice(); scheduleGather(); schedulePaint(); };
 

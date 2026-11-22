@@ -56,8 +56,10 @@ A drum kit's mics, or a bass DI and amp, stay together.
 
 As in Logic, grouped tracks comp together only when they have the same number of takes, and
 take 1 goes with take 1, take 2 with take 2, and so on. Take 1 has the same colour on every
-track, take 2 another. A grouped track with a different number of takes is left out and named
-in the status line. An empty New Version is not counted. Clicking a take's name plays that take
+track, take 2 another. If any grouped track has a different number of takes, the group doesn't
+comp together at all: the box reads "Group comp off", its tooltip lists each track's count, and
+swipes comp only the track you're on, so a kit's mics never end up on different takes. An empty
+New Version is not counted. Clicking a take's name plays that take
 on every grouped track, and renaming a take renames its match on each one.
 
 Comping a group, the grouped tracks show below this track's takes, as in Logic: each as a

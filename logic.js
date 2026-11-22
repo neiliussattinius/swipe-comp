@@ -782,11 +782,24 @@ const AddOnLogic = {
   },
 
   /**
+   * Whether a group's tracks can comp together, by Logic's rule: every track has the same number
+   * of recorded takes (an empty take is not counted). `{ lead, counts: [{ track, count }], same }`,
+   * `lead` being `lead`'s own count. When `same` is false the page comps no grouped track, not
+   * even the ones whose counts agree: comping some of a drum kit's mics and not others would
+   * pull the kit apart. (From 11/21 afternoon until that night it comped the agreeing ones.)
+   */
+  groupTakeCheck(session, lead, others) {
+    const n = AddOnLogic.recordedTakes(session, lead).length;
+    const counts = others.map((track) => ({ track, count: AddOnLogic.recordedTakes(session, track).length }));
+    return { lead: n, counts, same: counts.every((c) => c.count === n) };
+  },
+
+  /**
    * Which take on `other` goes with each of `lead`'s takes (lead take id -> other take id), by
    * Logic's rule for comping grouped tracks: they comp together only when they have the same
    * number of takes, and then take 1 goes with take 1, take 2 with take 2, and so on, since takes
    * recorded together on grouped tracks line up that way. Empty takes are not counted. Tracks
-   * whose counts differ get an empty map: the page leaves them out of the group comp and says so.
+   * whose counts differ get an empty map (groupTakeCheck stops the group comp first).
    * (Until 11/21 the page also matched takes by recording pass when the counts differed.)
    */
   matchTakes(session, lead, other) {
