@@ -1,10 +1,14 @@
 # Swipe Comping
 
+![Swipe Comping](icon.png)
+
 An add-on for Universal Audio LUNA that lets you do swipe-comping for tracks.
 
 Swipe Comping is a full LUNA page that shows every take on a track at once, stacked like a take
 folder. Drag across the part of a take you want, and it goes into the comp, crossfaded at every
 seam. It works the way Quick Swipe Comping works in Logic Pro.
+
+![Swipe Comping on a MIDI track: three takes, and a comp built from a part of each](docs/screenshot-midi.png)
 
 Needs LUNA 3.1.2 or newer. Tested on macOS; not yet on Windows.
 
