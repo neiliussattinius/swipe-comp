@@ -785,7 +785,7 @@ const AddOnLogic = {
   },
 
   /**
-   * How a track's groups comp (his rules, 11/21 night):
+   * How a track's groups comp:
    * - `'edit'`: LUNA links edits across the group (switched on, Edit ticked), so its tracks comp
    *   only together, never one alone. `lunaIds` is LUNA's own answer (groupMates), used first.
    * - `'ask'`: the track is only in groups that don't link edits (switched off, or no Edit): the
@@ -821,8 +821,7 @@ const AddOnLogic = {
    * `lead` being `lead`'s own count. When `same` is false the page comps no grouped track, not
    * even the ones whose counts agree: comping some of a drum kit's mics and not others would
    * pull the kit apart. In an edit group the page then comps nothing at all and says how to fix
-   * it; otherwise this track comps alone. (From 11/21 afternoon until that night it comped the
-   * agreeing ones.)
+   * it; otherwise this track comps alone.
    */
   groupTakeCheck(session, lead, others) {
     const n = AddOnLogic.recordedTakes(session, lead).length;
@@ -836,7 +835,6 @@ const AddOnLogic = {
    * number of takes, and then take 1 goes with take 1, take 2 with take 2, and so on, since takes
    * recorded together on grouped tracks line up that way. Empty takes are not counted. Tracks
    * whose counts differ get an empty map (groupTakeCheck stops the group comp first).
-   * (Until 11/21 the page also matched takes by recording pass when the counts differed.)
    */
   matchTakes(session, lead, other) {
     const a = AddOnLogic.recordedTakes(session, lead), b = AddOnLogic.recordedTakes(session, other);

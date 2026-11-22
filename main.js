@@ -62,7 +62,7 @@ function unevenNote() {
 }
 
 // ── comping a group ─────────────────────────────────────────────────────────────────────
-// His rules (11/21 night): when LUNA links edits across the track's group (switched on, Edit
+// The rules: when LUNA links edits across the track's group (switched on, Edit
 // ticked), its tracks comp only together, as Logic does with a group's Editing on: the same
 // sections on every track, each from its own matching take. When the track is in a group that
 // doesn't link edits (switched off, or no Edit), the page asks whether to comp the group
