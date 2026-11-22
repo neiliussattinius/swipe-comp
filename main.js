@@ -1,4 +1,4 @@
-// Swipe Comp: DOM wiring. Connects to LUNA, follows the open session, draws one track's takes
+// Swipe Comping: DOM wiring. Connects to LUNA, follows the open session, draws one track's takes
 // stacked with the comp above them, and turns swipes into comp edits through logic.js.
 // Every listener returned by onChange is kept so it can be released when things change.
 
@@ -1180,7 +1180,7 @@ function paintNotice() {
     const othersSoloed = session.visibleTracks.filter((t) => t !== track && t.solo?.on === true);
     if (held) {
       const one = held.count === 1;
-      text = `${compLane?.name.value ?? L.COMP_NAME} has ${held.count} clip${one ? '' : 's'} Swipe Comp didn't put there (a recording, or an edit made in LUNA). Your change would replace ${one ? 'it' : 'them'}.`;
+      text = `${compLane?.name.value ?? L.COMP_NAME} has ${held.count} clip${one ? '' : 's'} Swipe Comping didn't put there (a recording, or an edit made in LUNA). Your change would replace ${one ? 'it' : 'them'}.`;
       fixLabel = `Replace ${one ? 'it' : 'them'}`;
       const { next } = held;
       noticeFix = () => commit(next, true, true);

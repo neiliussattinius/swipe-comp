@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Swipe Comp, a LUNA Add On built with UA's LUNA Builder SDK",
+  "description": "Swipe Comping, a LUNA Add On built with UA's LUNA Builder SDK",
   "engines": {
     "node": ">=22"
   },

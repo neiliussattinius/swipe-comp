@@ -1,4 +1,4 @@
-// Swipe Comp: logic that does not touch the DOM, so tests can exercise it against Luna.MockEngine.
+// Swipe Comping: logic that does not touch the DOM, so tests can exercise it against Luna.MockEngine.
 //
 // The comp is a list of segments, each { start, stop, take }: ticks on the timeline and the uid
 // of the take (playlist) chosen for that stretch. Swiping edits the list (pure functions below);
