@@ -524,6 +524,31 @@ const AddOnLogic = {
     });
   },
 
+  /**
+   * A clip LUNA has rendered anew: warped there (or otherwise reworked, as a clip effect would).
+   * A warp keeps the clip's span and its place in the recording, so the span check in
+   * foreignClips cannot see it (measured on LUNA 3.1.2: two warp markers under the clip's
+   * `warps`, and a `render_source_uid`).
+   */
+  isWarped(clip) {
+    return !!clip?.renderSourceUid?.value;
+  },
+
+  /**
+   * Comp clips warped in LUNA that a change to `segments` would replace, losing the warp: those
+   * the rewrite does not keep. A rewrite that starts over (no record of the clips, or a new
+   * crossfade length) replaces them all. MIDI comps are rewritten whole, so every one counts.
+   */
+  warpedClipsReplaced(session, track, lane, segments, { fadeMs = 10 } = {}) {
+    const warped = (lane?.clips.items ?? []).filter((c) => AddOnLogic.isWarped(c));
+    if (!warped.length || AddOnLogic.isMidiTrack(track)) return warped;
+    const placed = AddOnLogic.store(session).value(track.id, 'placed').value;
+    const lastFade = AddOnLogic.savedFadeMs(session, track);
+    if (!Array.isArray(placed) || (lastFade !== undefined && lastFade !== fadeMs)) return warped;
+    const kept = new Set(AddOnLogic.reusableClips(lane, placed, AddOnLogic.plan(session, AddOnLogic.merge(segments))).values());
+    return warped.filter((c) => !kept.has(c));
+  },
+
   /** Whether a playlist on the track is newer (higher take number) than the comp. */
   compBelowNewer(session, track, lane) {
     if (!lane) return false;

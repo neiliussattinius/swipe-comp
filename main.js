@@ -839,8 +839,13 @@ async function commit(next, force = false, replaceForeign = false) {
     ...(compLane ? L.foreignClips(session, compLane, track) : []),
     ...(groupActive() ? mates.flatMap((m) => (m.lane ? L.foreignClips(session, m.lane, m.track) : [])) : []),
   ];
-  if (foreign.length) {
-    held = { next, count: foreign.length };
+  // Comp clips warped in LUNA that this change would replace: ask before losing the warp.
+  const warped = replaceForeign ? [] : [
+    ...L.warpedClipsReplaced(session, track, compLane, next, { fadeMs: fadeMs() }),
+    ...(groupActive() ? mates.flatMap((m) => L.warpedClipsReplaced(session, m.track, m.lane, L.mapSegments(next, m.map), { fadeMs: fadeMs() })) : []),
+  ];
+  if (foreign.length || warped.length) {
+    held = { next, count: foreign.length, warped };
     paintNotice();
     schedulePaint();
     return;
@@ -1214,9 +1219,14 @@ function paintNotice() {
     const playing = session.playlistFor(track);
     const othersSoloed = session.visibleTracks.filter((t) => t !== track && t.solo?.on === true);
     if (held) {
-      const one = held.count === 1;
-      text = `${compLane?.name.value ?? L.COMP_NAME} has ${held.count} clip${one ? '' : 's'} Swipe Comping didn't put there (a recording, or an edit made in LUNA). Your change would replace ${one ? 'it' : 'them'}.`;
-      fixLabel = `Replace ${one ? 'it' : 'them'}`;
+      const one = held.count === 1, w = held.warped ?? [], oneW = w.length === 1, both = held.count && w.length;
+      const t = session.musical.timeline, at = (c) => `"${c.name.value}" at bar ${t.barBeat(c.start.value).bar}`;
+      text = [
+        held.count ? `${compLane?.name.value ?? L.COMP_NAME} has ${held.count} clip${one ? '' : 's'} Swipe Comping didn't put there (a recording, or an edit made in LUNA).` : '',
+        w.length ? `${w.slice(0, 3).map(at).join(', ')}${w.length > 3 ? ` and ${w.length - 3} more` : ''} ${oneW ? 'was' : 'were'} warped in LUNA.` : '',
+        `Your change would replace ${both || !(held.count ? one : oneW) ? 'them' : 'it'}${w.length ? `, and the warp${oneW ? '' : 's'} with ${oneW && !held.count ? 'it' : 'them'}` : ''}.`,
+      ].filter(Boolean).join(' ');
+      fixLabel = `Replace ${both || !(held.count ? one : oneW) ? 'them' : 'it'}`;
       const { next } = held;
       noticeFix = () => commit(next, true, true);
       altLabel = 'Cancel my change';

@@ -419,6 +419,29 @@ const playedNotes = async (lane) => {
   return out.sort((x, y) => x[0] - y[0]);
 };
 
+describe('warped comp clips', () => {
+  it('asks before a change replaces a clip warped in LUNA, and not when the change leaves it', async () => {
+    const { engine, session, track, lanes } = await sessionWithTakes();
+    const comp = await L.ensureCompLane(session, track);
+    let list = L.applySwipe([], lanes[0].id, 0, 2 * BAR);
+    list = L.applySwipe(list, lanes[1].id, 2 * BAR, 4 * BAR);
+    await L.buildComp(session, track, comp, list);
+    await L.setFadeMs(session, track, 10);   // as the page records it after every build
+    await engine.settled();
+    await comp.clips.load();
+    const second = comp.clips.items.find((c) => c.start.value === 2 * BAR);
+    // A warp made in LUNA: LUNA renders the clip anew; its span and source offset stay.
+    engine.setValue(second.path, 'render_source_uid', 'rendered1');
+    await engine.settled();
+    expect(L.isWarped(second)).toBe(true);
+    // A swipe elsewhere keeps the warped clip; one across it would replace it.
+    expect(L.warpedClipsReplaced(session, track, comp, L.applySwipe(list, lanes[2].id, 0, BAR))).toEqual([]);
+    expect(L.warpedClipsReplaced(session, track, comp, L.applySwipe(list, lanes[2].id, 3 * BAR, 5 * BAR))).toEqual([second]);
+    // A new crossfade length rebuilds every clip, so it would replace it too.
+    expect(L.warpedClipsReplaced(session, track, comp, list, { fadeMs: 40 })).toEqual([second]);
+  });
+});
+
 describe('comping MIDI', () => {
   afterEach(() => { L.contextCommand = realContextCommand; });
 
