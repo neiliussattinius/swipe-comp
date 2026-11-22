@@ -15,7 +15,7 @@ Any one of these:
 - Download `Swipe-Comp-<version>.lunaaddon` from the latest release on this page and
   double-click it.
 - In LUNA's Add On showcase, import this repo by its address,
-  `https://github.com/neiliussattinius/swipe-comp`. LUNA reads the latest release, and checks
+  `https://github.com/neiliussattinius/swipe-comping`. LUNA reads the latest release, and checks
   for a newer one each time it starts.
 - If someone shared the `.lunaaddon` with you by a Dropbox, Google Drive or iCloud Drive link,
   import that link the same way.
