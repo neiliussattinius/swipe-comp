@@ -189,7 +189,7 @@ function paintGroup() {
     box.title = `${name} has Edit on in LUNA, so its tracks comp only together: the same sections on ${[track, ...mates.map((m) => m.track)].map((t) => t?.name.value).join(', ')}, each from its own matching take, as one undo step.\n\nTo comp one track on its own, turn off Edit for the group in LUNA, or switch the group off.`;
   } else if (off) {
     label.textContent = `Group comp off (${name}): takes don't match`;
-    box.title = `Grouped tracks comp together only when each has the same number of takes, as in Logic, so take 1 goes with take 1 on every track.\n\n${counts}\n\nSwipes here comp ${track?.name.value} alone. To comp the group, give every track the same number of takes in LUNA (record the missing pass, or delete the extra take).`;
+    box.title = `Grouped tracks comp together only when each has the same number of takes, as in Logic, so take 1 goes with take 1 on every track.\n\n${counts}\n\nSwipes here comp ${track?.name.value} alone. To comp the group, delete the takes in LUNA that weren't recorded on every track (a new take can't stand in for a pass that already happened).`;
   } else {
     label.textContent = `Comp the group (${name}: ${n} tracks)`;
     box.title = `Edit is off for ${name} in LUNA, so this is your choice. Ticked: comp ${[track, ...mates.map((m) => m.track)].map((t) => t?.name.value).join(', ')} together, the same sections on each, from each track's matching take, as one undo step. Unticked: comp ${track?.name.value} alone.`;

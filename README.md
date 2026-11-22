@@ -59,8 +59,9 @@ track; the "Comp the group" box in the header changes the answer.
 As in Logic, grouped tracks comp together only when they have the same number of takes, and
 take 1 goes with take 1, take 2 with take 2, and so on. Take 1 has the same colour on every
 track, take 2 another. An empty New Version is not counted. In a group with Edit on whose takes
-don't match, Swipe Comping shows what to fix instead of the takes: give every track the same number
-of takes, or turn off Edit for the group to comp one track at a time. In a group without Edit
+don't match, Swipe Comping shows what to do instead of the takes: delete the takes that weren't
+recorded on every track, or turn off Edit for the group to comp one track at a time. (Recording
+a new take can't fix it, since a new take can't stand in for a pass that already happened.) In a group without Edit
 whose takes don't match, it comps only the track you're on. Clicking a take's name plays that
 take on every grouped track, and renaming a take renames its match on each one.
 
