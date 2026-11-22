@@ -839,11 +839,23 @@ async function commit(next, force = false, replaceForeign = false) {
     ...(compLane ? L.foreignClips(session, compLane, track) : []),
     ...(groupActive() ? mates.flatMap((m) => (m.lane ? L.foreignClips(session, m.lane, m.track) : [])) : []),
   ];
-  // Comp clips warped in LUNA that this change would replace: ask before losing the warp.
-  const warped = replaceForeign ? [] : [
-    ...L.warpedClipsReplaced(session, track, compLane, next, { fadeMs: fadeMs() }),
-    ...(groupActive() ? mates.flatMap((m) => L.warpedClipsReplaced(session, m.track, m.lane, L.mapSegments(next, m.map), { fadeMs: fadeMs() })) : []),
-  ];
+  // Comp clips warped in LUNA that this change would replace: ask before losing the warp. (Read
+  // from LUNA, only for the clips the change would replace; `busy` meanwhile, so a second
+  // gesture waits.)
+  let warped = [];
+  if (!replaceForeign) {
+    busy = true;
+    try {
+      warped = [
+        ...await L.warpedClipsReplaced(session, track, compLane, next, { fadeMs: fadeMs() }),
+        ...(groupActive() ? (await Promise.all(mates.map((m) => L.warpedClipsReplaced(session, m.track, m.lane, L.mapSegments(next, m.map), { fadeMs: fadeMs() })))).flat() : []),
+      ];
+    } catch {
+      warped = [];
+    } finally {
+      busy = false;
+    }
+  }
   if (foreign.length || warped.length) {
     held = { next, count: foreign.length, warped };
     paintNotice();

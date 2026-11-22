@@ -430,15 +430,24 @@ describe('warped comp clips', () => {
     await engine.settled();
     await comp.clips.load();
     const second = comp.clips.items.find((c) => c.start.value === 2 * BAR);
-    // A warp made in LUNA: LUNA renders the clip anew; its span and source offset stay.
-    engine.setValue(second.path, 'render_source_uid', 'rendered1');
+    const first = comp.clips.items.find((c) => c.start.value === 0);
+    expect(await L.isWarped(session, second)).toBe(false);
+    // A warp made in LUNA: a moved marker under the clip's warps (LUNA may also render the clip
+    // anew, and later drop the rendering); its span and source offset stay.
+    engine.addNode(`${second.path}/warps/537`, { properties: { rowid: 537, type: 'warp', warp_type: 0, start: 78e9, start_original: 124e9, source_start: 33e9, source_start_original: 33e9 } });
     await engine.settled();
-    expect(L.isWarped(second)).toBe(true);
+    expect(await L.isWarped(session, second)).toBe(true);
+    // A rendering alone counts too.
+    engine.setValue(first.path, 'render_source_uid', 'rendered1');
+    await engine.settled();
+    expect(await L.isWarped(session, first)).toBe(true);
+    engine.setValue(first.path, 'render_source_uid', '');
+    await engine.settled();
     // A swipe elsewhere keeps the warped clip; one across it would replace it.
-    expect(L.warpedClipsReplaced(session, track, comp, L.applySwipe(list, lanes[2].id, 0, BAR))).toEqual([]);
-    expect(L.warpedClipsReplaced(session, track, comp, L.applySwipe(list, lanes[2].id, 3 * BAR, 5 * BAR))).toEqual([second]);
+    expect(await L.warpedClipsReplaced(session, track, comp, L.applySwipe(list, lanes[2].id, 0, BAR))).toEqual([]);
+    expect(await L.warpedClipsReplaced(session, track, comp, L.applySwipe(list, lanes[2].id, 3 * BAR, 5 * BAR))).toEqual([second]);
     // A new crossfade length rebuilds every clip, so it would replace it too.
-    expect(L.warpedClipsReplaced(session, track, comp, list, { fadeMs: 40 })).toEqual([second]);
+    expect(await L.warpedClipsReplaced(session, track, comp, list, { fadeMs: 40 })).toEqual([second]);
   });
 });
 
