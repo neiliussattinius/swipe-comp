@@ -454,14 +454,15 @@ describe('warped comp clips', () => {
 describe('sections from a warped take', () => {
   afterEach(() => { L.contextCommand = realContextCommand; });
 
-  it("are copied by LUNA's promote_takes, crossfaded, kept by later changes, and not taken for the user's warps", async () => {
+  // A comp of take 1 (bars 0-2) and take 2 (bars 2-4), take 2 warped in LUNA (a marker moved from
+  // where it was set), with promote_takes, which the mock lacks: it copies the take's clip, cut to
+  // the range, into the track's current playlist, with a uid unique in the session, and every one
+  // of the take's warp markers at the same place in the song (as LUNA does, measured 11/23).
+  async function warpedComp() {
     const { engine, session, track, lanes } = await sessionWithTakes();
-    // Take 2 is warped in LUNA: a marker moved from where it was set.
     const takeClip = lanes[1].clips.items[0];
     engine.addNode(`${takeClip.path}/warps/589`, { properties: { rowid: 589, type: 'warp', warp_type: 0, start: 514e9, start_original: 576e9, source_start: 3.6e9, source_start_original: 3.6e9 } });
     await engine.settled();
-    // promote_takes, which the mock lacks: copy the take's clip, cut to the range, into the
-    // track's current playlist, warps and all, with a uid unique in the session.
     const calls = [];
     let promoted = 0;
     L.contextCommand = (s2, name, payload) => {
@@ -476,7 +477,14 @@ describe('sections from a warped take', () => {
           const id = `promoted${++promoted}`, to = `/sessions/s/playlists/${dest}/clips/${id}`;
           const props = Object.fromEntries(['name', 'source_uid', 'source_stop', 'clip_type', 'gain', 'bypass', 'render_state', 'midi_source_start', 'layer', 'mute'].map((k) => [k, engine.value(from, k)]));
           engine.addNode(to, { properties: { ...props, uid: id, start: a, stop: b, source_start: engine.value(from, 'source_start') + (a - start) / BAR * 1e9, render_source_uid: '' } });
-          engine.addNode(`${to}/warps/9${promoted}`, { properties: { rowid: 900 + promoted, type: 'warp', warp_type: 0, start: 1e9, start_original: 2e9, source_start: 3.6e9, source_start_original: 3.6e9 } });
+          for (const [k, w] of engine.children(`${from}/warps`).entries()) {
+            const wp = `${from}/warps/${w}`, shift = start - a;   // marker starts count from the clip's own start
+            engine.addNode(`${to}/warps/${1000 * promoted + k}`, { properties: {
+              rowid: 1000 * promoted + k, type: engine.value(wp, 'type'), warp_type: 0,
+              start: engine.value(wp, 'start') + shift, start_original: engine.value(wp, 'start_original') + shift,
+              source_start: engine.value(wp, 'source_start'), source_start_original: engine.value(wp, 'source_start_original'),
+            } });
+          }
         }
       }
       return Promise.resolve(null);
@@ -488,26 +496,162 @@ describe('sections from a warped take', () => {
     await L.setFadeMs(session, track, 10);
     await engine.settled();
     await comp.clips.load();
+    const made = comp.clips.items.find((c) => c.id.startsWith('promoted'));
+    // A change elsewhere, and one across the copied section.
+    const later = () => L.applySwipe(L.savedSegments(session, track), lanes[2].id, 6 * BAR, 7 * BAR);
+    const across = () => L.applySwipe(L.savedSegments(session, track), lanes[2].id, 3 * BAR, 5 * BAR);
+    const record = () => L.store(session).value(track.id, 'placed').value.find((r) => r.byLuna);
+    return { engine, session, track, lanes, takeClip, comp, list, calls, made, later, across, record };
+  }
+
+  it("are copied by LUNA's promote_takes, crossfaded, kept by later changes, and not taken for the user's warps", async () => {
+    const { engine, session, track, lanes, comp, list, calls, made, later, across, record } = await warpedComp();
     expect(calls.filter((c) => c === 'promote_takes')).toHaveLength(1);
     expect(comp.clips.items.map((c) => [c.start.value / BAR, c.stop.value / BAR, c.id.startsWith('promoted')]).sort()).toEqual([[0, 2, false], [2, 4, true]]);
-    const made = comp.clips.items.find((c) => c.id.startsWith('promoted'));
     expect(L.foreignClips(session, comp, track)).toEqual([]);
     expect(L.madeByLuna(session, track, comp)).toEqual([made]);
     expect(L.misnamedCompClips(session, comp, list).map((m) => m.clip)).not.toContain(made);
-    // Found inside the change: named after its take and recorded by id as LUNA's.
+    // Found inside the change: named after its take and recorded by id as LUNA's, with the
+    // fingerprint of the warps it was copied with.
     expect(made.name.value).toBe(lanes[1].name.value);
-    expect(L.store(session).value(track.id, 'placed').value.find((r) => r.byLuna)).toMatchObject({ id: made.id, byLuna: true });
+    expect(record()).toMatchObject({ id: made.id, byLuna: true });
+    expect(typeof record().sig).toBe('string');
+    expect(await L.staleSections(session, track, comp, list)).toEqual([]);
     // A later change elsewhere keeps it (no second copy), and the warp guard does not take the
     // take's own warps for the user's, even for a change across it.
     calls.length = 0;
-    const later = L.applySwipe(L.savedSegments(session, track), lanes[2].id, 6 * BAR, 7 * BAR);
-    expect(await L.warpedClipsReplaced(session, track, comp, later)).toEqual([]);
-    expect(await L.warpedClipsReplaced(session, track, comp, L.applySwipe(list, lanes[2].id, 3 * BAR, 5 * BAR))).toEqual([]);
-    await L.buildComp(session, track, comp, later);
+    expect(await L.warpedClipsReplaced(session, track, comp, later())).toEqual([]);
+    expect(await L.warpedClipsReplaced(session, track, comp, across())).toEqual([]);
+    await L.buildComp(session, track, comp, later());
     await engine.settled();
     await comp.clips.load();
     expect(calls.includes('promote_takes')).toBe(false);
     expect(comp.clips.items).toContain(made);
+  });
+
+  it('a take warped again after it was copied: the comp keeps the old warps until a swipe covers the section, or the user asks', async () => {
+    const { engine, session, track, lanes, takeClip, comp, list, calls, made, later, record } = await warpedComp();
+    const oldSig = record().sig;
+    engine.setValue(`${takeClip.path}/warps/589`, 'start', 300e9);   // the take's marker moved again, in LUNA
+    await engine.settled();
+    const behind = await L.staleSections(session, track, comp, list);
+    expect(behind).toHaveLength(1);
+    expect(behind[0]).toMatchObject({ take: lanes[1].id, name: lanes[1].name.value, startTick: 2 * BAR, stopTick: 4 * BAR, left: false });
+    // Not the user's warp on the comp: the comp clip is as it was copied.
+    expect(await L.warpedClipsReplaced(session, track, comp, later())).toEqual([]);
+    // A swipe elsewhere leaves it as it is, old warps and all (a swipe changes only what it covers).
+    calls.length = 0;
+    await L.buildComp(session, track, comp, later(), { refresh: [[6 * BAR, 7 * BAR]] });
+    await engine.settled();
+    await comp.clips.load();
+    expect(calls.includes('promote_takes')).toBe(false);
+    expect(comp.clips.items).toContain(made);
+    expect(record().sig).toBe(oldSig);
+    expect(await L.staleSections(session, track, comp, L.savedSegments(session, track))).toHaveLength(1);
+    // Left as it is: no longer mentioned, and "Update them all" passes it by.
+    await L.setWarpsLeft(session, track, [behind[0].key]);
+    await engine.settled();
+    expect((await L.staleSections(session, track, comp, L.savedSegments(session, track)))[0].left).toBe(true);
+    await L.buildComp(session, track, comp, L.savedSegments(session, track), { refresh: true });
+    await engine.settled();
+    await comp.clips.load();
+    expect(calls.includes('promote_takes')).toBe(false);
+    // A swipe over part of it copies it afresh, with the take's new warps.
+    await L.buildComp(session, track, comp, L.savedSegments(session, track), { refresh: [[3 * BAR, 3.5 * BAR]] });
+    await engine.settled();
+    await comp.clips.load();
+    expect(calls.filter((c) => c === 'promote_takes')).toHaveLength(1);
+    expect(comp.clips.items).not.toContain(made);
+    expect(record().sig).not.toBe(oldSig);
+    expect(await L.staleSections(session, track, comp, L.savedSegments(session, track))).toEqual([]);
+  });
+
+  it('"Update them all" copies every section behind its take afresh; leaving one lasts until its take changes again', async () => {
+    const { engine, session, track, takeClip, comp, list, calls, made, record } = await warpedComp();
+    const oldSig = record().sig;
+    engine.setValue(`${takeClip.path}/warps/589`, 'start', 300e9);
+    await engine.settled();
+    const [one] = await L.staleSections(session, track, comp, list);
+    await L.setWarpsLeft(session, track, [one.key]);
+    await engine.settled();
+    // The take changes again: the section is behind again, and mentioned again.
+    engine.setValue(`${takeClip.path}/warps/589`, 'start', 250e9);
+    await engine.settled();
+    expect((await L.staleSections(session, track, comp, list))[0].left).toBe(false);
+    calls.length = 0;
+    await L.buildComp(session, track, comp, list, { refresh: true });
+    await engine.settled();
+    await comp.clips.load();
+    expect(calls.filter((c) => c === 'promote_takes')).toHaveLength(1);
+    expect(comp.clips.items).not.toContain(made);
+    expect(record().sig).not.toBe(oldSig);
+  });
+
+  it('a warp made on a comp clip LUNA copied is kept by a change elsewhere, and counted as the comp\'s own by one across it', async () => {
+    const { engine, session, track, comp, list, calls, made, later, across } = await warpedComp();
+    const w = engine.children(`${made.path}/warps`)[0];
+    engine.setValue(`${made.path}/warps/${w}`, 'start', engine.value(`${made.path}/warps/${w}`, 'start') + 10e9);   // warped on the comp, in LUNA
+    await engine.settled();
+    expect(await L.staleSections(session, track, comp, list)).toEqual([]);   // the take is unchanged
+    expect(await L.warpedClipsReplaced(session, track, comp, later())).toEqual([]);
+    expect(await L.warpedClipsReplaced(session, track, comp, across())).toEqual([made]);
+    calls.length = 0;
+    await L.buildComp(session, track, comp, later());
+    await engine.settled();
+    await comp.clips.load();
+    expect(calls.includes('promote_takes')).toBe(false);
+    expect(comp.clips.items).toContain(made);
+  });
+
+  it('a record from before fingerprints is taken as copied, and gets one at the next change', async () => {
+    const { engine, session, track, comp, list, calls, made, later, across, record } = await warpedComp();
+    const sig = record().sig;
+    const placed = L.store(session).value(track.id, 'placed').value.map(({ sig: _s, ...r }) => r);
+    await L.store(session).set(track.id, 'placed', placed, { undoable: false });
+    await engine.settled();
+    expect(record().sig).toBeUndefined();
+    expect(await L.staleSections(session, track, comp, list)).toEqual([]);
+    expect(await L.warpedClipsReplaced(session, track, comp, across())).toEqual([]);
+    calls.length = 0;
+    await L.buildComp(session, track, comp, later());
+    await engine.settled();
+    await comp.clips.load();
+    expect(calls.includes('promote_takes')).toBe(false);
+    expect(comp.clips.items).toContain(made);
+    expect(record().sig).toBe(sig);
+  });
+
+  it('a fingerprint ignores the few ticks LUNA places a copy off, but not a moved marker', () => {
+    const m = [[0, 0], [2 * BAR, 1e9], [3 * BAR + 1e9, 1.5e9], [4 * BAR, 2e9], [5 * BAR, 2.5e9], [8 * BAR, 4e9]].map(([tick, ns]) => ({ tick, ns }));
+    const sig = L.warpSig(m, 2 * BAR, 4 * BAR);
+    expect(L.warpSig(m.map((x, i) => ({ ...x, tick: x.tick + (i % 2 ? 100 : -56) })), 2 * BAR, 4 * BAR)).toBe(sig);
+    expect(L.warpSig(m.map((x, i) => (i === 2 ? { ...x, tick: x.tick + 5e9 } : x)), 2 * BAR, 4 * BAR)).not.toBe(sig);
+    expect(L.warpSig(m.map((x, i) => (i === 0 ? { ...x, tick: x.tick + 5e9 } : x)), 2 * BAR, 4 * BAR)).not.toBe(sig);   // the one just before shapes it too
+    expect(L.warpSig(m.map((x, i) => (i === 5 ? { ...x, tick: x.tick + 5e9 } : x)), 2 * BAR, 4 * BAR)).toBe(sig);       // one further off does not
+    expect(L.warpSig([], 0, BAR)).toBe(L.warpSig([], 2 * BAR, 3 * BAR));
+  });
+
+  it('tells a track with a warped take from one without', async () => {
+    const { engine, session, track, lanes } = await sessionWithTakes();
+    expect(await L.hasWarpedTakes(session, track)).toBe(false);
+    engine.addNode(`${lanes[2].clips.items[0].path}/warps/7`, { properties: { rowid: 7, type: 'warp', warp_type: 0, start: 10e9, start_original: 20e9, source_start: 1e9, source_start_original: 1e9 } });
+    await engine.settled();
+    expect(await L.hasWarpedTakes(session, track)).toBe(true);
+  });
+});
+
+describe('per-track answers', () => {
+  it('are kept in the session, off by default, and can be changed', async () => {
+    const { engine, session, track } = await sessionWithTakes();
+    await L.store(session).load();
+    expect(L.flag(session, track, 'warpAck')).toBe(false);
+    await L.setFlag(session, track, 'warpAck');
+    await engine.settled();
+    expect(L.flag(session, track, 'warpAck')).toBe(true);
+    expect(L.flag(session, track, 'compWarpsOk')).toBe(false);
+    await L.setFlag(session, track, 'warpAck', false);
+    await engine.settled();
+    expect(L.flag(session, track, 'warpAck')).toBe(false);
   });
 });
 
@@ -576,17 +720,22 @@ describe('comping an edit group', () => {
     expect(check.counts.map((c) => c.count)).toEqual([4]);
   });
 
-  it("reads LUNA's group list: which groups the track is in, switched on or not, with Edit or not", () => {
+  it("reads LUNA's group list: which groups the track is in, switched on or not, with Edit or Mix or not", () => {
     const group = (uid, name, attrs, ids) => ({
       properties: { uid: { value: uid }, name: { value: name }, group_attributes: { value: attrs } },
       children: [{ path: 'members', children: ids.map((id) => ({ properties: { track_uid: { value: id } } })) }],
     });
     const node = { children: [group('g1', 'Drums', 'edit,mix', ['k', 's', 'oh']), group('g2', 'Vox', 'mix', ['v1', 'v2']), group('g3', 'All', 'edit', ['k', 'v1'])] };
     expect(L.readGroups(node, ['g1'], 'k')).toEqual([
-      { uid: 'g1', name: 'Drums', on: true, edit: true, trackIds: ['s', 'oh'] },
-      { uid: 'g3', name: 'All', on: false, edit: true, trackIds: ['v1'] },
+      { uid: 'g1', name: 'Drums', on: true, edit: true, mix: true, trackIds: ['s', 'oh'] },
+      { uid: 'g3', name: 'All', on: false, edit: true, mix: false, trackIds: ['v1'] },
     ]);
     expect(L.readGroups(node, ['g1'], 'nobody')).toEqual([]);
+    // Solo goes with Mix, and only in a group switched on.
+    const groups = L.readGroups(node, ['g1', 'g2'], 'k');
+    expect(L.soloLinked(groups, 's')).toBe(true);
+    expect(L.soloLinked(groups, 'v1')).toBe(false);   // All has no Mix
+    expect(L.soloLinked(L.readGroups(node, [], 'k'), 's')).toBe(false);   // Drums switched off
   });
 
   it('comps a group with Edit on only together, and asks about a group without it', () => {
@@ -978,5 +1127,225 @@ describe('building the comp', () => {
     await engine.settled();
     await comp.clips.load();
     expect(comp.clips.items.map((c) => [c.start.value, c.stop.value])).toEqual([[0, 2 * BAR]]);
+  });
+});
+
+// The waveform pass: LUNA draws a take only once it has been shown. Measured 11/23 on LUNA 3.1.2:
+// an aborted continuous transaction leaves the connection replacing each command with the next,
+// which broke every later comp change, and warped drum takes were never drawn however long the
+// pass waited. So the pass must always commit, wait briefly, ask once, and give way when asked.
+describe('the waveform pass', () => {
+  afterEach(() => { L.sessionCommand = realSessionCommand; });
+
+  /** Three takes, each its own file with no waveform; showing a take draws it when `draws(version)`. */
+  async function sessionWithUndrawnTakes({ draws = () => false, failOn } = {}) {
+    const engine = new Luna.MockEngine();
+    engine.addSession('s', { name: 'Demo', tracks: ['Vox'], packageUid: 'pkg' });
+    for (const uid of ['r1', 'r2', 'r3']) engine.addSource('pkg', uid, { name: `${uid}.wav`, lengthNs: 20e9, analysis: false });
+    let clipCounter = 0;
+    engine.nextClipId = () => `clip${++clipCounter}`;
+    const shown = [];
+    engine.overrideCommand('/sessions/s/set_playlists', (data, e) => {
+      if (failOn === data.version) throw new Error('LUNA refused the switch');
+      for (const t of data.track_uid) {
+        const pl = e.children('/sessions/s/playlists').find((p) =>
+          e.value(`/sessions/s/playlists/${p}`, 'track_uid') === t && e.value(`/sessions/s/playlists/${p}`, 'version') === data.version);
+        if (!pl) continue;
+        e.setValue(`/sessions/s/tracks/${t}`, 'playlist_uid', pl);
+        shown.push(data.version);
+        if (draws(data.version)) {
+          const path = `/workspace/sessions/pkg/audio/r${data.version}/analysis/overview`;
+          e.addNode(path, { properties: { count: 100, md5: `md5-r${data.version}` } });
+        }
+      }
+      return null;
+    });
+    await engine.settled();
+    const luna = await Luna.connect({ port_: engine.port() });
+    const session = await luna.session();
+    await session.ready();
+    await Promise.all([session.musical.ready(), session.playlists.load(), session.sources?.load()]);
+    const track = session.tracks.items[0];
+    for (let i = 1; i < 3; i++) await session.newPlaylists([track.id]);
+    await engine.settled();
+    await session.playlists.membersReady();
+    const lanes = L.playlistsOf(session, track);
+    for (const [i, lane] of lanes.entries()) await session.insertClip({ playlistUid: lane.id, sourceUid: `r${i + 1}`, startTick: 0, stopTick: 4 * BAR, sourceStartNs: 0, sourceStopNs: 8e9 });
+    await engine.settled();
+    for (const lane of lanes) await lane.clips.load();
+    await L.showPlaylist(session, track.id, lanes[0].version.value);   // take 1 is playing
+    await engine.settled();
+    shown.length = 0;
+    return { engine, session, track, lanes, shown };
+  }
+
+  it('a take LUNA never draws is waited for briefly, asked for once, and the track goes back', async () => {
+    const { engine, session, track, lanes } = await sessionWithUndrawnTakes();
+    const missing = await L.unanalyzed(session, lanes);
+    expect(missing.map((m) => m.lane)).toEqual(lanes);
+    engine.transactions.length = 0;
+    const began = Date.now();
+    const { drawn, tried } = await L.analyzeTakes(session, track, missing, { waitMs: 150 });
+    expect(Date.now() - began).toBeLessThan(3000);
+    expect(drawn).toEqual([]);
+    expect(tried.map((s) => s.id).sort()).toEqual(['r1', 'r2', 'r3']);
+    expect(engine.transactions).toEqual(['begin', 'commit']);
+    await engine.settled();
+    expect(session.playlistFor(track)).toBe(lanes[0]);
+    // Not asked for again this visit.
+    expect(await L.unanalyzed(session, lanes, new Set(tried.map((s) => s.id)))).toEqual([]);
+  });
+
+  it('says which take it is showing, one visit per take, the playing take not counted', async () => {
+    const { session, track, lanes } = await sessionWithUndrawnTakes();
+    const calls = [];
+    await L.analyzeTakes(session, track, await L.unanalyzed(session, lanes), { waitMs: 50, onProgress: (n, of, lane) => calls.push([n, of, lane]) });
+    expect(calls).toEqual([[1, 2, lanes[1]], [2, 2, lanes[2]]]);
+  });
+
+  it('a take that is drawn when shown is counted as drawn', async () => {
+    const { session, track, lanes } = await sessionWithUndrawnTakes({ draws: (v) => v === 2 });
+    const { drawn, tried } = await L.analyzeTakes(session, track, await L.unanalyzed(session, lanes), { waitMs: 150 });
+    expect(drawn.map((s) => s.id)).toEqual(['r2']);
+    expect(tried).toHaveLength(3);
+  });
+
+  it('a switch LUNA refuses does not abort the pass: it goes on, puts the track back and commits', async () => {
+    const { engine, session, track, lanes } = await sessionWithUndrawnTakes({ failOn: 2 });
+    engine.transactions.length = 0;
+    const { tried } = await L.analyzeTakes(session, track, await L.unanalyzed(session, lanes), { waitMs: 100 });
+    expect(tried).toHaveLength(3);
+    expect(engine.transactions).toEqual(['begin', 'commit']);
+    await engine.settled();
+    expect(session.playlistFor(track)).toBe(lanes[0]);
+  });
+
+  it('asked to stop, the pass ends at once, puts the track back and commits', async () => {
+    const { engine, session, track, lanes, shown } = await sessionWithUndrawnTakes();
+    let stop = false;
+    engine.transactions.length = 0;
+    const run = L.analyzeTakes(session, track, await L.unanalyzed(session, lanes), { waitMs: 5000, shouldStop: () => stop });
+    await new Promise((r) => setTimeout(r, 300));
+    stop = true;
+    const began = Date.now();
+    const { tried } = await run;
+    expect(Date.now() - began).toBeLessThan(1000);
+    expect(tried).toHaveLength(2);   // take 1, playing (asked for, not visited), and the one visit made
+    expect(shown).toEqual([lanes[1].version.value, lanes[0].version.value]);
+    expect(engine.transactions).toEqual(['begin', 'commit']);
+    await engine.settled();
+    expect(session.playlistFor(track)).toBe(lanes[0]);
+  });
+
+  it('a take already playing is never visited, and with nothing else to visit there is no transaction', async () => {
+    const { engine, session, track, lanes, shown } = await sessionWithUndrawnTakes();
+    const playing = (await L.unanalyzed(session, lanes)).filter((m) => m.lane === lanes[0]);
+    engine.transactions.length = 0;
+    const { tried, drawn } = await L.analyzeTakes(session, track, playing, { waitMs: 100 });
+    expect(tried.map((s) => s.id)).toEqual(['r1']);
+    expect(drawn).toEqual([]);
+    expect(shown).toEqual([]);
+    expect(engine.transactions).toEqual([]);
+  });
+
+  it('already asked to stop, the pass starts no transaction', async () => {
+    const { engine, session, track, lanes, shown } = await sessionWithUndrawnTakes();
+    engine.transactions.length = 0;
+    await L.analyzeTakes(session, track, await L.unanalyzed(session, lanes), { shouldStop: () => true });
+    expect(shown).toEqual([]);
+    expect(engine.transactions).toEqual([]);
+  });
+
+  it('the whole pass stops after its time budget', async () => {
+    const { session, track, lanes } = await sessionWithUndrawnTakes();
+    const { tried } = await L.analyzeTakes(session, track, await L.unanalyzed(session, lanes), { waitMs: 400, budgetMs: 300 });
+    expect(tried.length).toBeLessThan(3);
+  });
+});
+
+// Warped clips are drawn from their recordings through their warp markers (LUNA never analyses
+// the rendering it plays; measured 11/23 on 96 warped clips).
+describe('drawing warped clips', () => {
+  const tl = { seconds: (tk) => tk / 100 };   // 100 ticks a second
+  const clip = { start: { value: 0 }, stop: { value: 1000 }, sourceStart: { value: 0 }, sourceStop: { value: 10e9 } };
+
+  it('between markers the audio runs evenly; outside them at its own speed', () => {
+    const nsAt = L.warpedNsAt(tl, clip, [{ tick: 200, ns: 1.5e9 }, { tick: 500, ns: 5e9 }]);
+    expect(nsAt(200)).toBe(1.5e9);
+    expect(nsAt(500)).toBe(5e9);
+    expect(nsAt(350)).toBeCloseTo(3.25e9);
+    expect(nsAt(100)).toBeCloseTo(0.5e9);   // 1 s before the first marker: 1 s earlier in the file
+    expect(nsAt(700)).toBeCloseTo(7e9);
+  });
+
+  it('with no markers (stretched whole) it runs evenly across the clip', () => {
+    const nsAt = L.warpedNsAt(tl, { ...clip, sourceStop: { value: 5e9 } }, []);
+    expect(nsAt(500)).toBeCloseTo(2.5e9);
+    expect(nsAt(1000)).toBeCloseTo(5e9);
+  });
+
+  it("a warped clip is drawn from its recording, through markers counted from the clip's start", async () => {
+    const engine = new Luna.MockEngine();
+    engine.addSession('s', { name: 'Demo', tracks: ['Vox'], packageUid: 'pkg' });
+    engine.addSource('pkg', 'rec', { name: 'rec.wav', lengthNs: 20e9 });
+    engine.addSource('pkg', 'rnd', { name: 'rnd.wav', lengthNs: 8e9, analysis: false });
+    const luna = await Luna.connect({ port_: engine.port() });
+    const session = await luna.session();
+    await session.ready();
+    await Promise.all([session.musical.ready(), session.playlists.load(), session.sources?.load()]);
+    const track = session.tracks.items[0];
+    const lane = L.playlistsOf(session, track)[0];
+    const c = await session.insertClip({ playlistUid: lane.id, sourceUid: 'rec', startTick: 4 * BAR, stopTick: 8 * BAR, sourceStartNs: 0, sourceStopNs: 8e9 });
+    await engine.settled();
+    await lane.clips.load();
+    const plain = lane.clips.items[0];
+    expect(L.isRendered(plain)).toBe(false);
+    expect(L.drawSource(session, plain).id).toBe('rec');
+    engine.setValue(c.path, 'render_source_uid', 'rnd');
+    engine.setValue(c.path, 'render_state', 'current');
+    engine.addNode(`${c.path}/warps/w1`, { properties: { type: 'warp', start: BAR, start_original: BAR + 10, source_start: 2.5e9, source_start_original: 2.5e9 } });
+    await engine.settled();
+    await lane.clips.reload?.();
+    await lane.clips.load();
+    const warped = lane.clips.items[0];
+    expect(L.isRendered(warped)).toBe(true);
+    expect(L.drawSource(session, warped).id).toBe('rec');   // the recording, not the rendering
+    expect(await L.warpMarkers(session, warped)).toEqual([{ tick: 5 * BAR, ns: 2.5e9, moved: true }]);
+    const audio = L.drawAudio(session, warped, await L.warpMarkers(session, warped));
+    expect(audio.source.id).toBe('rec');
+    expect(audio.nsAt(5 * BAR)).toBe(2.5e9);
+    // The waveform pass asks about the recording (drawn here), so this take needs no visit.
+    expect(await L.unanalyzed(session, [lane])).toEqual([]);
+    // LUNA dropped the rendering but the moved marker stayed: still drawn warped, as building treats it.
+    engine.setValue(c.path, 'render_source_uid', '');
+    engine.setValue(c.path, 'render_state', 'none');
+    await engine.settled();
+    await lane.clips.load();
+    const dropped = lane.clips.items[0];
+    expect(L.isRendered(dropped)).toBe(false);
+    const again = L.drawAudio(session, dropped, await L.warpMarkers(session, dropped));
+    expect(again.warped).toBe(true);
+    expect(again.nsAt(5 * BAR)).toBe(2.5e9);
+  });
+});
+
+describe("the page's own comp clips, placed a hair off by LUNA", () => {
+  it('are still its own: not foreign, made by LUNA, found where they were asked for', async () => {
+    const { engine, session, track, lanes } = await sessionWithTakes();
+    const lane = await L.ensureCompLane(session, track);
+    // LUNA's copy of a warped section lands 80 ticks early and 40 ticks late (seen 11/23).
+    await session.insertClip({ playlistUid: lane.id, sourceUid: 'rec', startTick: 2 * BAR - 80, stopTick: 4 * BAR + 40, sourceStartNs: 0, sourceStopNs: 1e9 });
+    await engine.settled();
+    await lane.clips.load();
+    const store = L.store(session);
+    await store.set(track.id, 'placed', [{ id: null, start: 2 * BAR, stop: 4 * BAR, take: lanes[0].id, byLuna: true }], { undoable: false });
+    expect(L.foreignClips(session, lane, track)).toEqual([]);
+    expect(L.madeByLuna(session, track, lane)).toEqual(lane.clips.items);
+    expect(await L.clipMadeAt(session, lane, 2 * BAR, 4 * BAR, new Set())).toBe(lane.clips.items[0].id);
+    // A clip that really is somewhere else is still foreign.
+    await session.insertClip({ playlistUid: lane.id, sourceUid: 'rec', startTick: 5 * BAR, stopTick: 6 * BAR, sourceStartNs: 0, sourceStopNs: 1e9 });
+    await engine.settled();
+    await lane.clips.load();
+    expect(L.foreignClips(session, lane, track).map((c) => c.start.value)).toEqual([5 * BAR]);
   });
 });

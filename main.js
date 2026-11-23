@@ -8,6 +8,16 @@ const GUTTER = 150, MARKS_H = 18, BAR_H = 22, COMP_H = 72, SIL_H = 26, LANE_H = 
 const RULER_H = MARKS_H + BAR_H;    // LUNA's markers, then the bar numbers
 const SIL_TOP = RULER_H + COMP_H;   // the Silence strip, pinned under the comp row
 
+// The working build can be installed in LUNA beside the release, under an id of its own containing
+// "testing" (LUNA serves an Add On's page from a host named after its id): it says so on the page.
+if (/testing/i.test(location.host)) {
+  document.title = 'TestingSwipeComp';
+  const tag = document.createElement('div');
+  tag.textContent = window.TEST_BUILD ? `TEST BUILD ${window.TEST_BUILD}` : 'TEST BUILD';
+  tag.style.cssText = 'position:fixed;right:10px;bottom:8px;z-index:50;padding:2px 8px;border-radius:3px;background:#b8860b;color:#111;font:700 11px system-ui,-apple-system,sans-serif;letter-spacing:.06em;pointer-events:none';
+  document.body.append(tag);
+}
+
 // Key names the way this computer says them: Cmd and Option on a Mac, Ctrl and Alt on Windows.
 // (The keys themselves already work on both: the handlers take metaKey or ctrlKey, and altKey.)
 const MAC = /Mac|iPhone|iPad/i.test(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || '');
@@ -23,7 +33,8 @@ let takes = [];
 let segments = [];      // the saved comp list
 let pending;            // a list being built, shown until LUNA has it
 let preview;            // { list, rect? } while dragging: the comp as it would be, and a swipe's outline
-let held;               // { next, count }: a change waiting because the comp holds clips the page did not place
+let held;               // { next, count, opts }: a change waiting because the comp holds clips the page did not place
+let stale = [];         // sections of the comp behind their take, warped again since they were copied (see checkStale)
 let drag;
 let view = { start: 0, end: 1 };
 let scene;              // waveform columns gathered for the current view
@@ -33,6 +44,15 @@ const cache = new Luna.Waveforms();
 let gatherTicket = 0, gatherFrame = 0, paintFrame = 0, headFrame = 0;
 
 const release = (list) => { for (const u of list.splice(0)) { try { u(); } catch { /* already gone */ } } };
+
+// A short log of what the page did and where a change stopped, to find out what went wrong:
+// `swipeLog` in the page (the last 300 lines), read from a test script or the web inspector.
+const swipeLog = [];
+window.swipeLog = swipeLog;
+function trace(...parts) {
+  swipeLog.push(`${new Date().toISOString().slice(11, 23)} ${parts.join(' ')}`);
+  if (swipeLog.length > 300) swipeLog.shift();
+}
 
 function setStatus(text, kind = '') {
   const el = $('status');
@@ -76,6 +96,7 @@ let groupOffs = [];
 let groupMode = 'none';  // 'edit' (LUNA links edits: comp only together), 'ask' (the user chooses), 'none'
 let groupKey = '';       // the group's tracks (ids, sorted): where the 'ask' answer is kept
 let groupNamesShown = [];
+let groupInfo = [];      // this track's LUNA groups, from groupsOf: which link Mix (and so solo)
 const groupName = () => (groupNamesShown.length ? groupNamesShown.join(' + ') : 'the group');
 
 // The answers to "comp the group together, or this track alone?", per set of grouped tracks
@@ -99,10 +120,18 @@ const groupBlocked = () => groupMode === 'edit' && uneven.length > 0;
 // A dark band above each grouped track's header row marks where the previous track's takes end.
 const GROUP_GAP = 14;
 let opened = new Set();   // grouped tracks shown open (track ids); closed by default
-/** The rows of the takes area, each with its `top`: { kind: 'take', track, take, lead } or { kind: 'mate', mate, gap }. */
+let leadClosed = false;   // comping a group: this track's takes hidden under its header
+const HEAD_H = 44;        // that header's height
+/**
+ * The rows of the takes area, each with its `top` and `h`: { kind: 'take', track, take, lead },
+ * { kind: 'mate', mate, gap }, or, comping a group, { kind: 'leadHead' } first: this track's own
+ * header, which opens and closes its takes and has its own small Solo, like the grouped tracks'.
+ */
 function rowsOf() {
-  const rows = takes.map((take) => ({ kind: 'take', track, take, lead: take }));
-  if (groupActive()) {
+  const group = groupActive();
+  const rows = group ? [{ kind: 'leadHead', h: HEAD_H }] : [];
+  if (!group || !leadClosed) rows.push(...takes.map((take) => ({ kind: 'take', track, take, lead: take })));
+  if (group) {
     for (const m of mates) {
       rows.push({ kind: 'mate', mate: m, gap: GROUP_GAP });
       if (!opened.has(m.track.id)) continue;
@@ -113,13 +142,13 @@ function rowsOf() {
     }
   }
   let y = 0;
-  for (const r of rows) { y += r.gap ?? 0; r.top = y; y += LANE_H; }
+  for (const r of rows) { y += r.gap ?? 0; r.top = y; r.h ??= LANE_H; y += r.h; }
   return rows;
 }
-const rowsHeight = (rows) => (rows.length ? rows[rows.length - 1].top + LANE_H : 0);
+const rowsHeight = (rows) => (rows.length ? rows[rows.length - 1].top + rows[rows.length - 1].h : 0);
 function rowAt(e) {
   const y = localY(e, takesCanvas);
-  return rowsOf().find((r) => y >= r.top && y < r.top + LANE_H);   // undefined in a band between tracks
+  return rowsOf().find((r) => y >= r.top && y < r.top + r.h);   // undefined in a band between tracks
 }
 
 /** Mates with no matching take for a take the comp uses, as "BGV 2: no match for T5". */
@@ -133,7 +162,7 @@ function groupGaps() {
 
 async function refreshGroup() {
   const forTrack = track;
-  if (!session || !forTrack) { mates = []; uneven = []; groupMode = 'none'; afterGroupChange(); return; }
+  if (!session || !forTrack) { mates = []; uneven = []; groupMode = 'none'; groupInfo = []; afterGroupChange(); return; }
   const [linked, groups] = await Promise.all([L.groupMates(session, forTrack), L.groupsOf(session, forTrack)]);
   const plan = L.groupPlan(groups, linked.map((t) => t.id));
   // Audio groups only for now: a MIDI track comps alone (group comping of MIDI not built or measured).
@@ -144,6 +173,7 @@ async function refreshGroup() {
   groupMode = found.length ? plan.mode : 'none';
   groupKey = [forTrack.id, ...found.map((t) => t.id)].sort().join(',');
   groupNamesShown = plan.names;
+  groupInfo = groups;
   leadTakeCount = check.lead;
   uneven = check.same ? [] : check.counts;
   mates = check.same ? found.map((t) => ({ track: t, lane: L.compLaneOf(session, t), map: L.matchTakes(session, forTrack, t) })) : [];
@@ -368,17 +398,21 @@ async function gather() {
         out.push({ start: a, stop: b, notes, lo, hi });
         continue;
       }
-      const audio = session.sources && Luna.clipAudio(clip, session.sources);
+      // A warped clip is drawn from its recording through its warp markers (see drawAudio).
+      const markers = await L.warpMarkers(session, clip);   // read once per clip (a plain clip has none, or none moved)
+      if (ticket !== gatherTicket) return;
+      const audio = L.drawAudio(session, clip, markers);
       if (!audio) { out.push({ start: a, stop: b, outline: true }); continue; }
       const px0 = Math.floor(x(a)), px1 = Math.ceil(x(b));
-      const from = Math.max(audio.startNs, Luna.audioNsAtTick(t, clip, audio, a) - Luna.OVERVIEW_PAIR_NS);
-      const to = Math.min(audio.stopNs, Luna.audioNsAtTick(t, clip, audio, b) + Luna.OVERVIEW_PAIR_NS);
+      const na = audio.nsAt(a), nb = audio.nsAt(b);
+      const from = Math.max(audio.startNs, Math.min(na, nb) - Luna.OVERVIEW_PAIR_NS);
+      const to = Math.min(audio.stopNs, Math.max(na, nb) + Luna.OVERVIEW_PAIR_NS);
       let range;
       try { range = await cache.range(audio.source, from, Math.max(from, to), kind); } catch { range = undefined; }
       if (ticket !== gatherTicket) return;
       if (!range?.count) { out.push({ start: a, stop: b, outline: true }); continue; }
       const cols = Luna.waveformColumns(range, Math.max(0, px1 - px0),
-        (i) => Luna.audioNsAtTick(t, clip, audio, tickAt(px0 + i + 0.5)),
+        (i) => audio.nsAt(tickAt(px0 + i + 0.5)),
         { gain: zoomGain * 10 ** ((clip.gain.value ?? 0) / 20) });
       out.push({ start: a, stop: b, px0, cols });
     }
@@ -523,7 +557,7 @@ function drawGrid(ctx, lines, top, h) {
  * open/close arrow of a grouped track's header row), the name, and an optional line under it
  * (the track's name, when several tracks' takes are showing).
  */
-function label(ctx, text, top, h, playing, color, { sub = '', arrow, bg } = {}) {
+function label(ctx, text, top, h, playing, color, { sub = '', subW = GUTTER - 40, arrow, bg } = {}) {
   ctx.fillStyle = playing ? UI.headOn : bg ?? UI.head;
   ctx.fillRect(0, top, GUTTER, h);
   ctx.fillStyle = color;
@@ -544,7 +578,7 @@ function label(ctx, text, top, h, playing, color, { sub = '', arrow, bg } = {}) 
   if (sub) {
     ctx.font = '11px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
     ctx.fillStyle = '#8f8f8f';
-    ctx.fillText(fitText(ctx, sub, GUTTER - 40), 32, top + 28.5);
+    ctx.fillText(fitText(ctx, sub, subW), 32, top + 28.5);
   }
   ctx.fillStyle = UI.headLine;
   ctx.fillRect(GUTTER - 1, top, 1, h);
@@ -756,6 +790,59 @@ function paintMateRow(ctx, m, top, grid, list, W) {
   const tc = m.track.color?.value, color = tc && (tc >>> 24) ? L.argbCss(tc) : '#8a8a8a';
   label(ctx, m.track.name.value ?? 'Track', top, LANE_H, !!m.lane && session.playlistFor(m.track) === m.lane, color,
     { sub: `${m.lane ? m.lane.name.value ?? L.COMP_NAME : 'no comp yet'} · ${n} take${n === 1 ? '' : 's'}`, arrow: open ? 'open' : 'closed', bg: '#2e2e2e' });
+  paintSoloChip(ctx, soloChip(top), m.track.solo?.on === true, !L.soloLinked(groupInfo, m.track.id));
+}
+
+// Each grouped track's own small Solo, in its header: it lights with LUNA's
+// solo for that track, so the big Solo at the top shows whether the group follows it. Where LUNA
+// links the group's solo (Mix on for the group) it only shows; where it doesn't, a click adds
+// that track to the solo, or takes it out.
+function soloChip(top) {
+  return { x: GUTTER - 34, y: top + 37, w: 24, h: 17 };
+}
+function paintSoloChip(ctx, r, on, clickable) {
+  ctx.fillStyle = on ? '#e8a93b' : clickable ? '#3a3a3a' : '#2a2a2a';
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.strokeStyle = on ? '#f0b54a' : clickable ? '#6a6a6a' : '#3e3e3e';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+  ctx.font = '700 11px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = on ? '#2a1c05' : clickable ? '#d6d6d6' : '#6a6a6a';
+  ctx.fillText('S', r.x + r.w / 2, r.y + r.h / 2 + 0.5);
+  ctx.textAlign = 'left';
+}
+/** The track whose small Solo is under the pointer (a grouped track, or this one on its header), or undefined. */
+function soloChipAt(e) {
+  const row = rowAt(e);
+  if (row?.kind !== 'mate' && row?.kind !== 'leadHead') return undefined;
+  const r = row.kind === 'mate' ? soloChip(row.top) : leadChip(row.top), px = localX(e, takesCanvas), py = localY(e, takesCanvas);
+  if (!(px >= r.x - 3 && px <= r.x + r.w + 3 && py >= r.y - 3 && py <= r.y + r.h + 3)) return undefined;
+  return row.kind === 'mate' ? row.mate.track : track;
+}
+
+// Comping a group, this track's own header, above its takes: its name ruled in its colour, an
+// arrow that hides or shows its takes, and its small Solo (the same as Solo at the top).
+function leadChip(top) {
+  return { x: GUTTER - 34, y: top + HEAD_H - 22, w: 24, h: 17 };
+}
+function paintLeadHead(ctx, top, h, W) {
+  const tc = track.color?.value, color = tc && (tc >>> 24) ? L.argbCss(tc) : '#8a8a8a', n = takes.length;
+  ctx.fillStyle = '#202020';
+  ctx.fillRect(GUTTER, top, W - GUTTER, h);
+  ctx.font = '12px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#6f6f6f';
+  ctx.fillText(leadClosed ? `${n} take${n === 1 ? '' : 's'} hidden: click the name to show them`
+    : `The track you're on: its comp is the row at the top`, GUTTER + 12, top + h / 2);
+  ctx.fillStyle = UI.sep;
+  ctx.fillRect(GUTTER, top + h - 1, W - GUTTER, 1);
+  label(ctx, track.name.value ?? 'Track', top, h, !!compLane && session.playlistFor(track) === compLane, color,
+    { sub: `${n} take${n === 1 ? '' : 's'}`, subW: GUTTER - 80, arrow: leadClosed ? 'closed' : 'open', bg: '#2e2e2e' });
+  ctx.fillStyle = color;
+  ctx.fillRect(0, top, W, 3);
+  paintSoloChip(ctx, leadChip(top), track.solo?.on === true, true);
 }
 
 function paintTakes(grid) {
@@ -766,6 +853,7 @@ function paintTakes(grid) {
   const list = shownSegments(), group = groupActive();
   rows.forEach((row) => {
     const top = row.top;
+    if (row.kind === 'leadHead') { paintLeadHead(ctx, top, row.h, W); return; }
     if (row.kind === 'mate') {
       // The band between the previous track's takes and this track: dark, ruled in the track's colour.
       const tc = row.mate.track.color?.value, color = tc && (tc >>> 24) ? L.argbCss(tc) : '#8a8a8a';
@@ -830,37 +918,75 @@ function placePlayhead() {
 const current = () => pending ?? segments;
 const sameList = (a, b) => JSON.stringify(L.merge(a)) === JSON.stringify(L.merge(b));
 
-async function commit(next, force = false, replaceForeign = false) {
-  if (busy || groupBlocked()) return;   // a linked group whose takes don't match comps nothing
-  if (!force && sameList(next, current())) { schedulePaint(); return; }
+/** The tracks a change comps: this one, and its group when it comps together. `[{ track, lane, list }]`. */
+function compMembers(next) {
+  return [{ track, lane: compLane, list: next }, ...(groupActive() ? mates.map((m) => ({ track: m.track, lane: m.lane, list: L.mapSegments(next, m.map) })) : [])];
+}
+
+/** Read LUNA with `busy` set, so a second gesture waits meanwhile. */
+async function whileBusy(fn) {
+  busy = true;
+  try { return await fn(); } finally { busy = false; }
+}
+
+/**
+ * Make a comp change. Before it, in turn: the warp heads-up on a track with warped takes not yet
+ * comped with it (once per track), the question about clips the page did not put on the comp
+ * (the yellow line), and the warning the first time a swipe would replace warps made on the comp
+ * itself (once per track). `opts`: `refresh`, the span a swipe or click covers
+ * (`[[a, b]]`), or true for "Update them all": sections there that are behind their take (warped
+ * again since they were copied) are copied afresh, and nowhere else (a swipe changes only the
+ * places it covers); `force` builds even an unchanged list; `replaceForeign` and
+ * `replaceWarps` skip those questions, already answered.
+ */
+async function commit(next, opts = {}) {
+  const { force = false, replaceForeign = false, replaceWarps = false, refresh } = opts;
+  trace('commit:', next.length, 'sections', force ? 'force' : '', replaceForeign ? 'replace' : '', '| busy', busy, 'analyzing', analyzing);
+  if (blocked()) { trace('commit: blocked'); return; }
+  await quietPass();                    // the waveform pass gives way (it would swallow these commands)
+  if (busy || groupBlocked()) { trace('commit: stopped, busy', busy, 'groupBlocked', groupBlocked()); return; }   // a linked group whose takes don't match comps nothing
+  const forTrack = track, members = compMembers(next);
+  // Stop before building: a refresh LUNA asked for during the reads below happens now.
+  const stop = (why) => { trace(why); schedulePaint(); if (rebindLater && !busy) void bindTrack(track?.id, false); };
+  if (!force && sameList(next, current())) {
+    // The same sections again: nothing to do, unless the swipe covers a section whose take was
+    // warped again after it was copied, when it brings the new warps in.
+    let behind = [];
+    if (refresh) {
+      try { behind = (await whileBusy(() => Promise.all(members.map((m) => L.staleSections(session, m.track, m.lane, m.list))))).flat(); } catch { behind = []; }
+      behind = behind.filter((p) => (refresh === true ? !p.left : L.refreshes(p, refresh)));
+    }
+    if (!behind.length) return stop('commit: nothing changes');
+    trace('commit: same sections,', behind.length, 'behind their takes\' warps');
+  }
+  // The heads-up, the first time a track with warped takes is comped (or once it has them).
+  let unread = [];
+  try { unread = await whileBusy(async () => { const out = []; for (const m of members) if (!L.flag(session, m.track, 'warpAck') && await L.hasWarpedTakes(session, m.track)) out.push(m.track); return out; }); } catch { unread = []; }
+  if (unread.length) {
+    trace('commit: warp heads-up for', unread.length, 'track(s)');
+    if (!(await warpHeadsUp(unread)) || track !== forTrack) return stop('commit: not now');
+  }
   // Clips on the comp that the page did not put there (a recording, an edit made in LUNA) would
   // be replaced by this rebuild: hold the change and ask first.
-  const foreign = replaceForeign ? [] : [
-    ...(compLane ? L.foreignClips(session, compLane, track) : []),
-    ...(groupActive() ? mates.flatMap((m) => (m.lane ? L.foreignClips(session, m.lane, m.track) : [])) : []),
-  ];
-  // Comp clips warped in LUNA that this change would replace: ask before losing the warp. (Read
-  // from LUNA, only for the clips the change would replace; `busy` meanwhile, so a second
-  // gesture waits.)
-  let warped = [];
-  if (!replaceForeign) {
-    busy = true;
-    try {
-      warped = [
-        ...await L.warpedClipsReplaced(session, track, compLane, next, { fadeMs: fadeMs() }),
-        ...(groupActive() ? (await Promise.all(mates.map((m) => L.warpedClipsReplaced(session, m.track, m.lane, L.mapSegments(next, m.map), { fadeMs: fadeMs() })))).flat() : []),
-      ];
-    } catch {
-      warped = [];
-    } finally {
-      busy = false;
-    }
-  }
-  if (foreign.length || warped.length) {
-    held = { next, count: foreign.length, warped };
+  const foreign = replaceForeign ? [] : members.flatMap((m) => (m.lane ? L.foreignClips(session, m.lane, m.track) : []));
+  trace('commit: foreign', foreign.length);
+  if (foreign.length) {
+    held = { next, count: foreign.length, opts };
     paintNotice();
-    schedulePaint();
-    return;
+    return stop('commit: held for clips the page did not place');
+  }
+  // Warps made on the comp itself that this change would replace: a warning the first time on a
+  // track, saying it won't ask again there; after that, none.
+  if (!replaceWarps) {
+    const asking = members.filter((m) => m.lane && !L.flag(session, m.track, 'compWarpsOk'));
+    let warped = [];
+    try {
+      warped = (await whileBusy(() => Promise.all(asking.map((m) => L.warpedClipsReplaced(session, m.track, m.lane, m.list, { fadeMs: fadeMs(), refresh }))))).flat();
+    } catch { warped = []; }
+    trace('commit: comp warps replaced', warped.length);
+    if (warped.length) {
+      if (!(await compWarpWarning(warped, members.map((m) => m.track))) || track !== forTrack) return stop('commit: cancelled');
+    }
   }
   held = undefined;
   busy = true;
@@ -874,18 +1000,21 @@ async function commit(next, force = false, replaceForeign = false) {
     } else if (groupActive()) {
       // The same sections on every grouped track, each from its matching take: one undo step.
       if (!compLane) compLane = await L.ensureCompLane(session, track);
-      const lanes = await L.buildGroupComp(session, track, compLane, mates, next, { fadeMs: fadeMs() });
+      const lanes = await L.buildGroupComp(session, track, compLane, mates, next, { fadeMs: fadeMs(), refresh, onStep: (text) => setStatus(text, 'busy') });
       mates.forEach((m, i) => { m.lane = lanes[i + 1]; });
       for (const t of [track, ...mates.map((m) => m.track)]) await L.setFadeMs(session, t, fadeMs());
     } else {
       if (!compLane) compLane = await L.ensureCompLane(session, track);
-      await L.buildComp(session, track, compLane, next, { fadeMs: fadeMs() });
+      await L.buildComp(session, track, compLane, next, { fadeMs: fadeMs(), refresh });
       await L.setFadeMs(session, track, fadeMs());   // so the next visit keeps these seams' length
     }
     segments = L.savedSegments(session, track);
+    trace('commit: built,', segments.length, 'sections saved');
     setStatus(summary());
   } catch (e) {
-    setStatus(`Could not build the comp: ${e.message ?? e}`, 'error');
+    trace('commit: failed:', e.message ?? e);
+    // LUNA rolled the change back, so the comp is as it was (a SwipeComp playlist made for it stays, empty, for next time).
+    setStatus(`Could not build the comp, so it is as it was. LUNA said: ${e.message ?? e}`, 'error');
   } finally {
     pending = undefined;
     busy = false;
@@ -894,6 +1023,7 @@ async function commit(next, force = false, replaceForeign = false) {
     scheduleGather();
     schedulePaint();
     scheduleNotice();
+    scheduleStale();
   }
 }
 
@@ -915,39 +1045,228 @@ async function nameClipsIfNeeded() {
   }
 }
 
-let analyzing = false, analyzeAgain = false;
-/** Have LUNA analyse any take it has no waveform for yet. Only while stopped, so nothing is heard. */
-async function drawMissingWaveforms() {
-  if (analyzing) { analyzeAgain = true; return; }   // asked again mid-run (the group came in): run once more after
-  if (!track || busy || session.transport.playing.value) return;
+// The waveform pass: LUNA draws a take only once it has been shown, so the page shows each take
+// with no waveform for a moment and comes back (see analyzeTakes). It runs when a track is opened
+// (or its group is newly shown), the first time takes are seen. Swiping is no use without the
+// waveforms, so while it runs a box in the middle of the page says what LUNA is doing, with its
+// progress, and covers the page: clicks, Space and Cmd+Z wait until it is done.
+// It cannot hang: a take LUNA never draws is given up after a few seconds, the pass after 90.
+// `busy` is set meanwhile, so nothing else writes to LUNA; `blocked()` is busy with something else.
+let analyzing = false, analyzeAgain = false, stopPass = false, passWanted = false, passDone = Promise.resolve();
+const triedSources = new Set();   // asked for once this visit: never again (some takes LUNA never draws)
+const blocked = () => busy && !analyzing;
+/** Stop a waveform pass in progress and wait until it has put every playlist back. */
+async function quietPass() {
+  if (analyzing) trace('quietPass: stopping the waveform pass');
+  while (analyzing) { stopPass = true; await passDone; }
+}
+
+// The box shown while the pass runs.
+const passBox = document.createElement('div');
+passBox.style.cssText = 'position:fixed;inset:0;z-index:40;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);cursor:wait';
+passBox.innerHTML = `
+  <div style="width:min(460px,calc(100vw - 32px));background:#262626;border:1px solid #444;border-radius:8px;padding:20px 22px;color:#ddd;font:13px/1.45 system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;box-shadow:0 10px 40px rgba(0,0,0,0.5)">
+    <div style="font-size:15px;font-weight:600;color:#fff;margin-bottom:6px">Drawing waveforms</div>
+    <div style="color:#bbb;margin-bottom:12px">LUNA draws a take's waveform the first time it's shown, so Swipe Comping is showing each take in LUNA for a moment. This happens once per take.</div>
+    <div data-what style="margin-bottom:8px;color:#eee;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+    <div style="height:6px;background:#3a3a3a;border-radius:3px;overflow:hidden"><div data-bar style="height:100%;width:0;background:#ffb347;transition:width .2s"></div></div>
+    <div style="color:#888;font-size:12px;margin-top:10px">A take LUNA can't draw (a warped take, say) is skipped after a few seconds.</div>
+  </div>`;
+document.body.append(passBox);
+function showPass(n, of, lane) {
+  const where = lane.trackUid.value !== track?.id ? ` on ${session.tracks.byId(lane.trackUid.value)?.name.value ?? 'a grouped track'}` : '';
+  passBox.querySelector('[data-what]').textContent = `Take ${n} of ${of}: ${lane.name.value ?? 'take'}${where}`;
+  passBox.querySelector('[data-bar]').style.width = `${Math.round(((n - 1) / of) * 100)}%`;
+  passBox.style.display = 'flex';
+}
+// While the box is up, keys wait too (Space would start playback mid-pass; Cmd+Z would undo).
+window.addEventListener('keydown', (e) => { if (passBox.style.display !== 'none') { e.preventDefault(); e.stopImmediatePropagation(); } }, true);
+
+// ── warps: the heads-up, the warning, a comp behind its takes ─────────────────────────────
+// Say up front, once per track, what happens to warps when a track with
+// warped takes is comped, and let him proceed or not; warn once per track, front and center, the
+// first time a swipe would replace warps made on the comp itself, and then never again there.
+
+// A box mid-page that asks, with two buttons; it covers the page until answered. Escape is "no".
+const askBox = document.createElement('div');
+askBox.style.cssText = 'position:fixed;inset:0;z-index:45;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.55)';
+askBox.innerHTML = `
+  <div style="width:min(520px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;background:#262626;border:1px solid #444;border-radius:8px;padding:20px 22px;color:#ddd;font:13px/1.5 system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;box-shadow:0 10px 40px rgba(0,0,0,0.5)">
+    <div data-title style="font-size:15px;font-weight:600;color:#fff;margin-bottom:10px"></div>
+    <div data-body></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+      <button data-no style="font:inherit;background:transparent;color:#ddd;border:1px solid #555;border-radius:6px;padding:5px 12px;cursor:pointer"></button>
+      <button data-yes style="font:inherit;font-weight:600;background:#F7C449;color:#000;border:0;border-radius:6px;padding:5px 14px;cursor:pointer"></button>
+    </div>
+  </div>`;
+document.body.append(askBox);
+let askDone;   // answers the box showing, if any
+/** Ask in the box. Resolves true for `yes`, false for `no` (or when the track changes meanwhile). */
+function ask({ title, paras, yes, no }) {
+  askDone?.(false);
+  askBox.querySelector('[data-title]').textContent = title;
+  askBox.querySelector('[data-body]').replaceChildren(...paras.map((text) => {
+    const p = document.createElement('p');
+    p.style.margin = '0 0 9px';
+    p.textContent = keyNames(text);
+    return p;
+  }));
+  askBox.querySelector('[data-yes]').textContent = yes;
+  askBox.querySelector('[data-no]').textContent = no;
+  askBox.style.display = 'flex';
+  return new Promise((resolve) => { askDone = (v) => { askDone = undefined; askBox.style.display = 'none'; resolve(v); }; });
+}
+for (const [sel, v] of [['[data-yes]', true], ['[data-no]', false]]) {
+  askBox.querySelector(sel).addEventListener('mousedown', (e) => e.preventDefault());
+  askBox.querySelector(sel).onclick = () => askDone?.(v);
+}
+window.addEventListener('keydown', (e) => {
+  if (askBox.style.display === 'none') return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  if (e.key === 'Escape') askDone?.(false);
+}, true);
+
+/**
+ * The heads-up before comping tracks with warped takes: what happens to warps and what could be
+ * changed, then Proceed or Not now. Proceed is remembered per track (in the session); Not now
+ * leaves it to ask again at the next swipe. Resolves whether to proceed.
+ */
+async function warpHeadsUp(tracks) {
+  const yes = await ask({
+    title: tracks.length === 1 ? `"${tracks[0].name.value}" has warped takes` : `${tracks.length} of the tracks you're comping have warped takes`,
+    paras: [
+      'When you swipe a section of a warped take, Swipe Comping has LUNA copy it into the comp with the take\'s warps, so the comp plays it just as the take does.',
+      'If you warp a take again after comping from it, the comp keeps the warps it was copied with, and a yellow line tells you. Re-swipe a section to bring the new warps in there, or update them all from the line, or leave them as they are. A swipe changes only the sections it touches.',
+      'Warps you make on the comp itself last until a swipe covers them: that section is copied in again from its take, and the comp\'s own warp there is replaced. The first time a swipe would do that on a track, Swipe Comping warns you, once.',
+      'So where you can, comp first and warp the finished comp last, so timing edits come at the end.',
+    ],
+    yes: 'Proceed',
+    no: 'Not now',
+  });
+  if (yes) for (const t of tracks) await L.setFlag(session, t, 'warpAck').catch(() => {});
+  return yes;
+}
+
+/**
+ * The warning the first time a swipe would replace warps made on the comp itself, on these
+ * tracks: front and center, saying it won't ask again there. Resolves whether to go ahead.
+ */
+async function compWarpWarning(clips, tracks) {
+  const t = session.musical.timeline, at = (c) => `"${c.name.value}" at bar ${t.barBeat(c.start.value).bar}`;
+  const one = clips.length === 1, many = tracks.length > 1;
+  const listed = `${clips.slice(0, 3).map(at).join(', ')}${clips.length > 3 ? ` and ${clips.length - 3} more` : ''}`;
+  const yes = await ask({
+    title: 'This swipe replaces warps made on the comp',
+    paras: [
+      `${listed} ${one ? 'was' : 'were'} warped on the comp itself, in LUNA. This swipe copies ${one ? 'that section' : 'those sections'} in again from ${one ? 'its take' : 'their takes'}, so the comp's own warp${one ? '' : 's'} there ${one ? 'is' : 'are'} replaced. Cmd+Z takes the swipe back.`,
+      `Swipe Comping won't ask again on ${many ? `these ${tracks.length} tracks` : 'this track'}: from now on, a swipe over warps made on the comp replaces them.`,
+    ],
+    yes: 'Replace them',
+    no: 'Cancel my swipe',
+  });
+  if (yes) for (const tr of tracks) await L.setFlag(session, tr, 'compWarpsOk').catch(() => {});
+  return yes;
+}
+
+/**
+ * On opening a track with warped takes not yet comped with them: the heads-up, after the
+ * waveforms, for it and the grouped tracks it comps with, so a group is told once.
+ */
+async function offerHeadsUp() {
+  // After the waveforms, including a second pass for grouped tracks that came in meanwhile (it
+  // starts just after the first ends).
+  for (let i = 0; i < 2; i++) {
+    while (analyzing) await passDone;
+    await new Promise((r) => setTimeout(r, 60));
+  }
+  if (!track || askDone) return;
+  const forTrack = track, unread = [];
+  try {
+    for (const m of compMembers(segments)) if (!L.flag(session, m.track, 'warpAck') && await L.hasWarpedTakes(session, m.track)) unread.push(m.track);
+  } catch { return; }
+  if (unread.length && track === forTrack && !askDone) await warpHeadsUp(unread);
+}
+
+// A take warped again after its sections were copied leaves the comp playing its old warps there:
+// the yellow line says so (see paintNotice). Looked for when a track is opened, after a change or
+// an undo, and when a take's rendering changes; a swipe of the same sections looks for itself.
+let staleTimer;
+function scheduleStale() {
+  clearTimeout(staleTimer);
+  staleTimer = setTimeout(() => void checkStale(), 400);
+}
+async function checkStale() {
+  if (!session || !track || !compLane) { stale = []; return; }
+  if (busy) { scheduleStale(); return; }
+  const forTrack = track;
+  let found = [];
+  try {
+    found = (await Promise.all(compMembers(segments).filter((m) => m.lane)
+      .map(async (m) => (await L.staleSections(session, m.track, m.lane, m.list)).map((p) => ({ ...p, track: m.track }))))).flat();
+  } catch (e) {
+    trace('stale check failed:', e.message ?? e);
+  }
+  if (track !== forTrack) return;
+  if (found.length) trace('stale:', found.length, 'section(s) behind their takes:', [...new Set(found.map((p) => p.name))].join(', '));
+  stale = found;
+  paintNotice();
+}
+
+/** Have LUNA draw any take it has no waveform for yet. Only while stopped, so nothing is heard. */
+function drawMissingWaveforms() {
+  if (analyzing) { analyzeAgain = true; return passDone; }   // asked again mid-run (the group came in): once more after
+  passDone = runWaveformPass();
+  return passDone;
+}
+async function runWaveformPass() {
+  if (!track) return;
+  if (busy || session.transport.playing.value) { passWanted = true; return; }   // run when stopped / free
+  passWanted = false;
   analyzing = true;
+  stopPass = false;
   let mine = false;   // whether this call set `busy`, so it only clears its own
+  const forTrack = track;
   try {
     // Comping a group, the grouped tracks' takes and comps too (their rows draw them), in the same undo step.
     const others = groupActive() ? mates.flatMap((m) => [...(m.lane ? [m.lane] : []), ...L.takesOf(session, m.track)]) : [];
-    const missing = await L.unanalyzed(session, [...(compLane ? [compLane] : []), ...takes, ...others]);
-    if (!missing.length || busy || session.transport.playing.value) return;
+    const missing = await L.unanalyzed(session, [...(compLane ? [compLane] : []), ...takes, ...others], triedSources);
+    if (!missing.length || busy || stopPass || session.transport.playing.value) return;
     busy = mine = true;
-    setStatus(`Asking LUNA for the waveforms of ${missing.length} take${missing.length === 1 ? '' : 's'}...`, 'busy');
-    const done = await L.analyzeTakes(session, track, missing);
-    for (const s of done) cache.invalidate(s.id);
-    setStatus(summary());
+    trace('pass:', missing.length, 'files without waveforms on', forTrack.name.value, '|', [...new Set(missing.map((m) => m.lane.name.value))].join(', '));
+    setStatus('Drawing waveforms...', 'busy');
+    const { drawn, tried } = await L.analyzeTakes(session, forTrack, missing, {
+      shouldStop: () => stopPass || session.transport.playing.value,
+      onProgress: showPass,
+    });
+    trace('pass: tried', tried.length, 'drawn', drawn.length, stopPass ? '(stopped)' : '');
+    for (const s of tried) triedSources.add(s.id);
+    for (const s of drawn) cache.invalidate(s.id);
+    if (session.transport.playing.value) passWanted = true;   // cut short by playback: finish once it stops
+    const drawnIds = new Set(drawn.map((s) => s.id));
+    const left = new Set(missing.filter((m) => !drawnIds.has(m.source.id)).map((m) => m.lane)).size;
+    setStatus(left ? `${summary()} · ${left} take${left === 1 ? '' : 's'} without a waveform` : summary());
   } catch (e) {
+    trace('pass: failed:', e.message ?? e);
     setStatus(`Could not get every waveform: ${e.message ?? e}`, 'error');
   } finally {
+    passBox.style.display = 'none';
     analyzing = false;
     if (mine) {
       busy = false;
+      paintUndo();
       if (rebindLater) await bindTrack(track?.id, false);
     }
     scheduleGather();
     schedulePaint();
-    if (analyzeAgain) { analyzeAgain = false; setTimeout(() => void drawMissingWaveforms(), 0); }
+    if (analyzeAgain) { analyzeAgain = false; if (!stopPass || track !== forTrack) setTimeout(() => void drawMissingWaveforms(), 0); }
   }
 }
 
 async function audition(lane) {
-  if (!lane || busy) return;
+  if (!lane || blocked()) return;
+  await quietPass();
+  if (busy) return;
   try { await playEverywhere(lane); } catch (e) { setStatus(e.message, 'error'); }
   schedulePaint();
 }
@@ -999,19 +1318,20 @@ function moveEdgeDrag(px) {
 }
 
 function endDrag() {
-  const next = preview?.list;
+  const next = preview?.list, rect = preview?.rect;
   drag = undefined;
   preview = undefined;
-  if (next) void commit(next);
+  // A swipe refreshes sections behind their take only where it covers (an edge drag, nowhere).
+  if (next) void commit(next, rect && !rect.erase ? { refresh: [[rect.a, rect.b]] } : {});
   else schedulePaint();
 }
 
 // On a take row `drag.take` is the take the comp list knows: this track's take, or, on a grouped
 // track's row, the take of this track it matches (`drag.track` is the row's own track).
 takesCanvas.addEventListener('pointerdown', (e) => {
-  if (!track || busy || e.button !== 0) return;
+  if (!track || blocked() || e.button !== 0) return;   // during the waveform pass the swipe goes ahead; commit waits for it
   const px = localX(e, takesCanvas), row = rowAt(e);
-  if (!row || px < GUTTER) return;   // clicks on a name are handled by click / dblclick below
+  if (!row || px < GUTTER || row.kind === 'leadHead') return;   // clicks on a name are handled by click / dblclick below
   if (row.kind === 'mate') {
     // A grouped track's comp: its seams are the comp's seams, so they drag like the comp row's.
     const edge = edgeAt(px);
@@ -1028,8 +1348,14 @@ takesCanvas.addEventListener('pointermove', (e) => {
   const px = localX(e, takesCanvas);
   if (!drag) {
     const row = rowAt(e);
-    const over = track && row && px >= GUTTER && !busy && (row.kind === 'mate' ? edgeAt(px) : edgeAt(px, row.lead.id));
+    const over = track && row && px >= GUTTER && !blocked() && row.kind !== 'leadHead' && (row.kind === 'mate' ? edgeAt(px) : edgeAt(px, row.lead.id));
     takesCanvas.style.cursor = over ? EDGE_CURSOR : track && row && px < GUTTER ? 'pointer' : '';
+    const chip = track && soloChipAt(e);
+    const tip = !chip ? '' : chip === track ? `Solo ${track.name.value} (the same as Solo at the top)`
+      : L.soloLinked(groupInfo, chip.id)
+        ? `${chip.name.value} solos together with ${track.name.value}: its group has Mix on in LUNA`
+        : `Solo ${chip.name.value} too, or take it out of the solo`;
+    if (takesCanvas.title !== tip) takesCanvas.title = tip;
     return;
   }
   if (drag.kind === 'edge') { moveEdgeDrag(px); return; }
@@ -1050,15 +1376,17 @@ takesCanvas.addEventListener('pointerup', (e) => {
   const d = drag, px = localX(e, takesCanvas);
   if (!preview && Math.abs(px - d.x0) < 4) {
     const tick = tickAt(px), list = current();
-    let next;
+    let next, refresh;
     if (d.erase) {
       const hit = list.find((s) => s.start <= tick && tick < s.stop);
       next = hit ? L.clearRange(list, hit.start, hit.stop) : undefined;
     } else {
       next = L.clickChoose(list, d.take.id, tick, L.extent([d.take]));
+      const sec = next?.find((s) => s.start <= tick && tick < s.stop);   // a click covers the section it chose
+      if (sec) refresh = [[sec.start, sec.stop]];
     }
     drag = undefined;
-    if (next) void commit(next);
+    if (next) void commit(next, refresh ? { refresh } : {});
     else schedulePaint();
     return;
   }
@@ -1074,9 +1402,25 @@ takesCanvas.addEventListener('pointercancel', () => { drag = undefined; preview 
 let nameClickTimer;
 takesCanvas.addEventListener('click', (e) => {
   if (!track || localX(e, takesCanvas) >= GUTTER) return;
+  const chip = soloChipAt(e);
+  if (chip) {
+    // A small Solo: this track's always; a grouped track's adds it to the solo or takes it out,
+    // unless LUNA links it to this track's.
+    clearTimeout(nameClickTimer);
+    if (!blocked() && chip.solo && (chip === track || !L.soloLinked(groupInfo, chip.id))) {
+      quietPass().then(() => chip.solo.toggle()).catch((err) => setStatus(err.message ?? String(err), 'error'));
+    }
+    return;
+  }
   const row = rowAt(e);
   if (!row) return;
   clearTimeout(nameClickTimer);
+  if (row.kind === 'leadHead') {   // this track's header: hide or show its takes
+    leadClosed = !leadClosed;
+    scheduleGather();
+    schedulePaint();
+    return;
+  }
   nameClickTimer = setTimeout(() => {
     if (row.kind === 'take') { void audition(row.lead); return; }
     const id = row.mate.track.id;
@@ -1086,11 +1430,12 @@ takesCanvas.addEventListener('click', (e) => {
   }, 250);
 });
 takesCanvas.addEventListener('dblclick', (e) => {
-  if (!track || localX(e, takesCanvas) >= GUTTER) return;
+  if (!track || localX(e, takesCanvas) >= GUTTER || soloChipAt(e)) return;
   clearTimeout(nameClickTimer);
   const row = rowAt(e);
   if (!row) return;
-  if (row.kind === 'mate') { if (!busy) void bindTrack(row.mate.track.id, false); return; }
+  if (row.kind === 'leadHead') return;
+  if (row.kind === 'mate') { if (!blocked()) void bindTrack(row.mate.track.id, false); return; }
   startRename(row.lead, row.top);
 });
 
@@ -1108,6 +1453,7 @@ function startRename(take, top) {
     done = true;
     input.hidden = true;
     input.onkeydown = input.onblur = null;
+    if (save) await quietPass();
     if (save && !busy) {
       busy = true;
       try {
@@ -1148,12 +1494,12 @@ topCanvas.addEventListener('pointerdown', (e) => {
   const tag = tagAt(px, py);
   if (tag) { void session.transport.seek(Math.max(0, Math.round(tag.m.location.value))); return; }
   if (inSilence) {
-    if (busy) return;
+    if (blocked()) return;
     drag = { kind: 'silence', x0: px, t0: tickAt(px) };
     topCanvas.setPointerCapture(e.pointerId);
     return;
   }
-  const edge = inComp && !busy && edgeAt(px);
+  const edge = inComp && !blocked() && edgeAt(px);
   if (edge) { beginEdgeDrag(e, topCanvas, edge); return; }
   void session.transport.seek(Math.max(0, Math.round(tickAt(px))));
 });
@@ -1162,7 +1508,7 @@ topCanvas.addEventListener('pointermove', (e) => {
   if (!drag) {
     const tag = track && px >= GUTTER ? tagAt(px, py) : undefined, tip = tag ? markerTip(tag.m) : '';
     if (topCanvas.title !== tip) topCanvas.title = tip;
-    topCanvas.style.cursor = !track || px < GUTTER ? '' : tag || markAt(px, py) ? 'pointer' : py >= RULER_H && py < SIL_TOP && !busy && edgeAt(px) ? EDGE_CURSOR : '';
+    topCanvas.style.cursor = !track || px < GUTTER ? '' : tag || markAt(px, py) ? 'pointer' : py >= RULER_H && py < SIL_TOP && !blocked() && edgeAt(px) ? EDGE_CURSOR : '';
     return;
   }
   if (drag.kind === 'edge') { moveEdgeDrag(px); return; }
@@ -1231,16 +1577,11 @@ function paintNotice() {
     const playing = session.playlistFor(track);
     const othersSoloed = session.visibleTracks.filter((t) => t !== track && t.solo?.on === true);
     if (held) {
-      const one = held.count === 1, w = held.warped ?? [], oneW = w.length === 1, both = held.count && w.length;
-      const t = session.musical.timeline, at = (c) => `"${c.name.value}" at bar ${t.barBeat(c.start.value).bar}`;
-      text = [
-        held.count ? `${compLane?.name.value ?? L.COMP_NAME} has ${held.count} clip${one ? '' : 's'} Swipe Comping didn't put there (a recording, or an edit made in LUNA).` : '',
-        w.length ? `${w.slice(0, 3).map(at).join(', ')}${w.length > 3 ? ` and ${w.length - 3} more` : ''} ${oneW ? 'was' : 'were'} warped in LUNA.` : '',
-        `Your change would replace ${both || !(held.count ? one : oneW) ? 'them' : 'it'}${w.length ? `, and the warp${oneW ? '' : 's'} with ${oneW && !held.count ? 'it' : 'them'}` : ''}.`,
-      ].filter(Boolean).join(' ');
-      fixLabel = `Replace ${both || !(held.count ? one : oneW) ? 'them' : 'it'}`;
-      const { next } = held;
-      noticeFix = () => commit(next, true, true);
+      const one = held.count === 1;
+      text = `${compLane?.name.value ?? L.COMP_NAME} has ${held.count} clip${one ? '' : 's'} Swipe Comping didn't put there (a recording, or an edit made in LUNA). Your change would replace ${one ? 'it' : 'them'}.`;
+      fixLabel = `Replace ${one ? 'it' : 'them'}`;
+      const { next, opts } = held;
+      noticeFix = () => commit(next, { ...opts, force: true, replaceForeign: true });
       altLabel = 'Cancel my change';
       noticeAlt = () => { held = undefined; paintNotice(); schedulePaint(); };
     } else if (groupMode === 'ask' && mates.length && groupChoices[groupKey] === undefined) {
@@ -1251,10 +1592,25 @@ function paintNotice() {
       noticeFix = () => chooseGroup(true);
       altLabel = 'Just this track';
       noticeAlt = () => chooseGroup(false);
+    } else if (compLane && stale.some((p) => !p.left)) {
+      // Sections whose take was warped again after they were copied (see checkStale). They stay as
+      // they are until swiped over, updated from here, or left as they are.
+      const due = stale.filter((p) => !p.left);
+      const names = [...new Set(due.map((p) => p.name))], n = due.length, tracks = new Set(due.map((p) => p.track)).size;
+      const one = names.length === 1;
+      text = `${names.map((q) => `"${q}"`).join(', ')} ${one ? 'has' : 'have'} different warps from when you comped from ${one ? 'it' : 'them'}, so the comp still plays the old warps in ${n} section${n === 1 ? '' : 's'}${tracks > 1 ? ` across ${tracks} tracks` : ''}. Re-swipe a section to bring the new warps in there.`;
+      fixLabel = n === 1 ? 'Update it' : 'Update them all';
+      noticeFix = () => commit(current(), { force: true, refresh: true });
+      altLabel = 'Leave them as they are';
+      noticeAlt = async () => {
+        // Remember every section behind its take on each track, so none is mentioned again until its take changes again.
+        for (const t of new Set(stale.map((p) => p.track))) await L.setWarpsLeft(session, t, stale.filter((p) => p.track === t).map((p) => p.key));
+        await checkStale();
+      };
     } else if (!compLane && segments.length) {
       text = `The ${L.COMP_NAME} playlist is gone (deleted in LUNA?). Your ${segments.length} comp section${segments.length === 1 ? ' is' : 's are'} still saved.`;
       fixLabel = 'Rebuild it';
-      noticeFix = () => commit(current(), true);
+      noticeFix = () => commit(current(), { force: true });
     } else if (compLane && playing && playing !== compLane) {
       text = `LUNA is playing ${playing.name.value} on this track, not the comp.`;
       fixLabel = 'Hear the comp';
@@ -1301,15 +1657,15 @@ function paintRaise() {
 }
 $('raise').addEventListener('mousedown', (e) => e.preventDefault());
 $('raise').onclick = () => {
-  if (!session || !track || !compLane || busy) return;
+  if (!session || !track || !compLane || blocked()) return;
   const all = [{ track, lane: compLane }, ...(groupActive() ? mates.filter((m) => m.lane) : [])];
-  (async () => { for (const m of all) await L.keepCompOnTop(session, m.track, m.lane); })()
+  (async () => { await quietPass(); for (const m of all) await L.keepCompOnTop(session, m.track, m.lane); })()
     .then(paintNotice, (e) => setStatus(e.message ?? String(e), 'error'));
 };
 
 for (const [id, get] of [['noticeFix', () => noticeFix], ['noticeAlt', () => noticeAlt]]) {
   $(id).addEventListener('mousedown', (e) => e.preventDefault());
-  $(id).onclick = () => { const fn = get(); if (fn) Promise.resolve(fn()).catch((e) => setStatus(e.message ?? String(e), 'error')); };
+  $(id).onclick = () => { const fn = get(); if (fn) quietPass().then(fn).catch((e) => setStatus(e.message ?? String(e), 'error')); };
 }
 
 // Play / stop and solo, mirroring LUNA's state.
@@ -1323,11 +1679,12 @@ function paintTransport() {
   solo.classList.toggle('on', soloed);
   solo.disabled = !track;
 }
-$('play').onclick = () => {
+$('play').onclick = async () => {
   if (!session) return;
+  if (!session.transport.playing.value) await quietPass();   // no take switched in while it plays
   L.playOrStop(session, view.start, view.end).catch((e) => setStatus(e.message ?? String(e), 'error'));
 };
-$('solo').onclick = () => { if (track) track.solo.toggle().catch((e) => setStatus(e.message ?? String(e), 'error')); };
+$('solo').onclick = () => { if (track) quietPass().then(() => track.solo.toggle()).catch((e) => setStatus(e.message ?? String(e), 'error')); };
 
 // Undo and Redo step through LUNA's own undo history (shared with everything done in LUNA). LUNA's
 // Cmd+Z is not sure to reach a full Add On page, so the page has buttons, named after the step
@@ -1353,7 +1710,7 @@ async function readUndoSteps() {
 }
 function paintUndo() {
   const u = $('undo'), r = $('redo');
-  const canU = !!session && !busy && session.canUndo.value === true, canR = !!session && !busy && session.canRedo.value === true;
+  const canU = !!session && !blocked() && session.canUndo.value === true, canR = !!session && !blocked() && session.canRedo.value === true;
   if (u.disabled !== !canU) u.disabled = !canU;
   if (r.disabled !== !canR) r.disabled = !canR;
   const ut = keyNames(undoSteps.undo ? `Undo "${undoSteps.undo}" (Cmd+Z)` : 'Undo (Cmd+Z)');
@@ -1362,9 +1719,12 @@ function paintUndo() {
   if (r.title !== rt) r.title = rt;
 }
 async function undoOrRedo(redo) {
-  if (!session || busy) return;
+  if (!session || blocked()) return;
+  await quietPass();
+  if (busy) return;
   if (!(redo ? session.canRedo.value : session.canUndo.value)) return;
   const name = redo ? undoSteps.redo : undoSteps.undo;
+  trace(redo ? 'redo' : 'undo', `"${name}"`);
   try {
     await (redo ? session.redo() : session.undo());
     setStatus(`${redo ? 'Redid' : 'Undid'} ${name ? `"${name}"` : 'the last change'}`);
@@ -1393,7 +1753,7 @@ for (const el of document.querySelectorAll('header select, header input')) {
 $('fit').onclick = fit;
 $('zoomIn').onclick = () => zoom(0.5);
 $('zoomOut').onclick = () => zoom(2);
-$('clear').onclick = () => { if (track && !busy && current().length) void commit([]); };
+$('clear').onclick = () => { if (track && !blocked() && current().length) void commit([]); };
 $('track').onchange = () => void bindTrack($('track').value, true);
 
 // Base: fill the comp's gaps with one take (on an empty comp, the whole take).
@@ -1405,7 +1765,7 @@ function fillBaseSelect() {
 $('base').onchange = () => {
   const take = takes.find((t) => t.id === $('base').value);
   $('base').value = '';
-  if (!take || !track || busy) return;
+  if (!take || !track || blocked()) return;
   const next = L.fillGaps(current(), take.id, L.extent([take]));
   if (sameList(next, current())) { setStatus(`No gaps for ${take.name.value} to fill: the comp has a section wherever it has audio.`); return; }
   void commit(next);
@@ -1547,6 +1907,7 @@ function bindClipProps() {
       }
       for (const prop of [clip.start, clip.stop, clip.sourceStart, clip.layer, clip.gain, clip.renderSourceUid]) clipOffs.push(prop.onChange(scheduleGather));
       if (lane === compLane) clipOffs.push(clip.name.onChange(scheduleNotice));
+      else clipOffs.push(clip.renderSourceUid.onChange(scheduleStale));   // a take warped anew
     }
   }
 }
@@ -1555,8 +1916,13 @@ async function bindTrack(id, refit) {
   release(trackOffs);
   release(clipOffs);
   rebindLater = false;
-  if (!track || track.id !== id) {
+  const opened = !track || track.id !== id;   // a track newly opened, not the same one refreshed after an edit
+  if (opened) {
+    if (analyzing) stopPass = true;               // the last track's waveform pass gives way
+    askDone?.(false);                             // and so does a question about it
+    leadClosed = false;                           // a track opened shows its takes
     held = undefined;                                  // a held change belongs to its track
+    stale = [];
     mates = []; release(groupOffs); paintGroup();      // and so does a group, until refreshGroup looks again
   }
   track = id ? session.tracks.byId(id) : undefined;
@@ -1586,8 +1952,9 @@ async function bindTrack(id, refit) {
     if (!busy) setStatus(summary());
     schedulePaint();
     scheduleNotice();
+    scheduleStale();
   }));
-  trackOffs.push(L.store(session).value(track.id, 'placed').onChange(scheduleNotice));
+  trackOffs.push(L.store(session).value(track.id, 'placed').onChange(() => { scheduleNotice(); scheduleStale(); }));
   trackOffs.push(track.playlistUid.onChange(() => { paintNotice(); schedulePaint(); }));
   trackOffs.push(L.store(session).value(track.id, 'onTop').onChange(paintNotice));
   trackOffs.push(track.name.onChange(() => { fillTrackSelect(); setStatus(summary()); }));
@@ -1599,11 +1966,18 @@ async function bindTrack(id, refit) {
   }
   bindClipProps();
   setStatus(summary());
-  void refreshGroup();
+  const grouped = refreshGroup().catch(() => {});
   if (refit) fit();
   scheduleGather();
   schedulePaint();
-  void (async () => { await nameClipsIfNeeded(); await drawMissingWaveforms(); })();
+  // Waveforms are fetched when a track is opened (or a pass is still owed), never on the refresh
+  // after an edit or an undo: that would add a step after the user's own and end their redo.
+  // Then, on opening, the warp heads-up if the track needs it, and a look for sections behind their takes.
+  void (async () => {
+    await nameClipsIfNeeded();
+    if (opened || passWanted) await drawMissingWaveforms();
+    if (opened) { await grouped; await offerHeadsUp(); void checkStale(); }
+  })();
 }
 
 async function bindSession() {
@@ -1636,7 +2010,7 @@ async function bindSession() {
   const watchSolos = async () => {
     release(soloOffs);
     await Promise.all(session.visibleTracks.map((t) => t.controls.load().catch(() => {})));
-    for (const t of session.visibleTracks) if (t.solo) soloOffs.push(t.solo.real.onChange(paintTransport));
+    for (const t of session.visibleTracks) if (t.solo) soloOffs.push(t.solo.real.onChange(() => { paintTransport(); schedulePaint(); }));   // the grouped tracks' small Solos too
     paintTransport();
   };
   sessionOffs.push(() => release(soloOffs));
@@ -1651,7 +2025,7 @@ async function bindSession() {
   scheduleUndoSteps();
   sessionOffs.push(session.transport.playing.onChange(() => {
     paintTransport();
-    if (!session.transport.playing.value) void drawMissingWaveforms();
+    if (!session.transport.playing.value && passWanted) void drawMissingWaveforms();
   }));
   paintTransport();
   sessionOffs.push(session.musical.timeline.onChange(scheduleGather));

@@ -72,13 +72,19 @@ counts match and that track plays silence wherever the comp uses that pass. In a
 whose takes don't match, it comps only the track you're on. Clicking a take's name plays that
 take on every grouped track, and renaming a take renames its match on each one.
 
-Comping a group, the grouped tracks show below this track's takes, as in Logic, each after a
+Comping a group, the track you're on gets a header row of its own above its takes (click its
+name to hide or show them), and the grouped tracks show below, as in Logic, each after a
 dark band in its track colour: a header row with its own comp, drawn from its own recording.
 Click a grouped track's name to show or hide its takes; you can swipe on those too, and the whole group follows. Double-click
 it to make it the track you're working on.
 
-Group comping has been tried in LUNA on a group made from a copied track, not yet on a group
-recorded together (a drum kit, say). Reports welcome.
+Each track's header has a small S, lit when LUNA has that track soloed, so you can see
+whether the group follows the Solo button at the top. If the group has Mix on in LUNA, it does,
+and the small buttons only show it. If not, the top Solo solos just the track you're on, and
+clicking a small S adds that track to the solo, or takes it out.
+
+Group comping has been used in LUNA on a drum kit recorded together and on groups made from
+copied tracks. Reports welcome.
 
 ## MIDI tracks
 
@@ -99,11 +105,21 @@ MIDI has no crossfades (LUNA fades audio clips only), so the Crossfade setting i
   stays until a swipe moves that piece or seam.
 - If SwipeComp holds clips the page didn't put there (a recording, say), the page asks before
   replacing them.
-- LUNA has no waveform for a take until it has been on the Timeline. When the page opens a
-  track it shows each such take for a moment, which leaves one undo step, "Draw take
-  waveforms", that changes nothing.
+- LUNA has no waveform for a take until it has been on the Timeline. The first time the page
+  opens a track with such takes, a box in the middle of the page says it is drawing them and
+  shows each one in LUNA for a moment; that takes a few seconds, happens once per take, and
+  leaves one undo step, "Draw take waveforms", that changes nothing.
 - Grouped MIDI tracks comp one track at a time for now; group comping is audio only.
-- Takes are assumed not to be time-stretched. Warped takes are not supported.
+- Warped and time-stretched takes work. A section from a warped take is copied into the comp
+  by LUNA itself, with its warp markers where they were, and its waveform is drawn from the
+  original recording through those markers, as LUNA plays it. The first time you comp a track
+  with warped takes, a box explains what happens to warps; you can go ahead or not.
+- If you warp a take again after comping from it, the comp keeps the warps it was copied with,
+  and a yellow line tells you. Re-swipe a section to bring the new warps in there, update them
+  all from the line, or leave them as they are. A swipe changes only the sections it touches.
+- Warps you make on the comp itself last until a swipe covers them. The first time a swipe would
+  replace them on a track, a box warns you, once; after that the page doesn't ask on that track.
+  Where you can, comp first and warp the finished comp last.
 - What the page remembers (the comp's sections, which playlist is SwipeComp) is saved inside
   the LUNA session.
 

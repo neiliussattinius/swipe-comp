@@ -10,6 +10,12 @@ const AddOnLogic = {
   STORE: 'com.neilsattin.swipe_comp',
   // A name of its own, so a playlist the user made and called "Comp" is never mistaken for it.
   COMP_NAME: 'SwipeComp',
+  // How far apart two clip edges can be and still be the same edge: a ten-thousandth of a beat
+  // (about 50 microseconds at 120 bpm), far shorter than any section. LUNA places what it copies
+  // a little off the ticks asked for (40 to 80 ticks, 11/23: a promoted warped section; a sample is
+  // about 5 million ticks), so an exact match took the page's own warped comp clips for foreign
+  // ones and asked before every swipe.
+  SLACK: Luna.TICKS_PER_BEAT / 10000,
 
   // ── the comp list ──────────────────────────────────────────────────────────────────────
 
@@ -362,10 +368,12 @@ const AddOnLogic = {
 
   /**
    * The clips the comp needs: for each segment, each piece of its take's audio inside it,
-   * with the matching span of the recording. Assumes takes are not time-stretched (recorded
-   * takes are not).
+   * with the matching span of the recording in a straight line. That span is used only for a
+   * plain take: a piece of a warped take (`warped`, by clip id) is copied by LUNA's promote_takes,
+   * which keeps its warp markers and finds its own span. Given the take clips' markers (`markers`,
+   * by clip id, from warpInfo), such a piece carries their fingerprint over its span (`sig`).
    */
-  plan(session, segments, warped) {
+  plan(session, segments, warped, markers) {
     const t = session.musical.timeline, pieces = [];
     for (const s of segments) {
       const take = session.playlists.byId(s.take);
@@ -380,54 +388,239 @@ const AddOnLogic = {
           continue;
         }
         const at = (tick) => clip.sourceStart.value + (t.seconds(tick) - t.seconds(clip.start.value)) * 1e9;
+        const isWarped = !!warped?.has(clip.id), list = isWarped && markers?.get(clip.id);
         pieces.push({
-          clip, take: s.take, name: take.name.value ?? clip.name.value, warped: !!warped?.has(clip.id),
+          clip, take: s.take, name: take.name.value ?? clip.name.value, warped: isWarped,
           startTick: a, stopTick: b, sourceStartNs: Math.round(at(a)), sourceStopNs: Math.round(at(b)),
+          ...(list ? { sig: AddOnLogic.warpSig(list, a, b) } : {}),
         });
       }
     }
     return pieces;
   },
 
-  /** Audio files of these playlists that LUNA has not analysed yet, each with a lane using it. */
-  async unanalyzed(session, lanes) {
+  /**
+   * Audio files of these playlists that LUNA has not analysed yet, each with a lane using it: the
+   * files the page draws from (see drawSource). Sources in `skip` (ids) are left out: those already
+   * asked for once (see analyzeTakes).
+   */
+  async unanalyzed(session, lanes, skip = new Set()) {
     const seen = new Set(), out = [];
     for (const lane of lanes) {
       for (const clip of lane.clips.items) {
-        const audio = session.sources && Luna.clipAudio(clip, session.sources);
-        if (!audio || seen.has(audio.source.id)) continue;
-        seen.add(audio.source.id);
-        if (!(await audio.source.overviewInfo())) out.push({ lane, source: audio.source });
+        const source = AddOnLogic.drawSource(session, clip);
+        if (!source || seen.has(source.id) || skip.has(source.id)) continue;
+        seen.add(source.id);
+        if (!(await AddOnLogic.hasOverview(source))) out.push({ lane, source });
       }
     }
     return out;
   },
 
+  // ── drawing warped clips ──────────────────────────────────────────────────────────────
+  // A warped clip (LUNA plays a time-stretched rendering of it, `render_source_uid` set) is drawn
+  // from its original recording, bent through its warp markers as LUNA plays it. LUNA never
+  // analyses the rendering: measured on 96 warped clips in one session, every rendering had
+  // no waveform and every original had one (quantized drums, edited horns, tuned vocals).
+
+  /** Whether LUNA plays a rendering of this clip rather than its recording. */
+  isRendered(clip) {
+    return clip?.clipType.value !== 'midi' && !!clip?.renderSourceUid.value;
+  },
+
+  /** The file the page draws a clip's waveform from: its recording, even for a warped clip. */
+  drawSource(session, clip) {
+    if (!session.sources || clip.clipType.value === 'midi') return undefined;
+    if (AddOnLogic.isRendered(clip)) return session.sources.byId(clip.sourceUid.value);
+    return Luna.clipAudio(clip, session.sources)?.source;
+  },
+
+  warpCache: new Map(),
+  /**
+   * A clip's warp markers, `[{ tick, ns, moved }]` by tick: the file at `ns` (its `source_start`)
+   * plays at `tick` (the clip's start plus the marker's `start`; markers count from the clip's own
+   * start, measured 11/21 and 11/23); `moved` when the marker is no longer where it was set. Read
+   * from LUNA once per clip and kept until the clip or its rendering changes (a new warp makes a
+   * new rendering), or read afresh with `{ fresh: true }` (a comp change, which must know).
+   */
+  async warpMarkers(session, clip, { fresh = false } = {}) {
+    const key = [clip.renderSourceUid.value, clip.start.value, clip.stop.value, clip.sourceStart.value].join('|');
+    const hit = AddOnLogic.warpCache.get(clip.id);
+    if (!fresh && hit?.key === key) return hit.list;
+    let list = [];
+    try {
+      const node = await session.client.raw.get(`${clip.path}/warps`, { levels: 2 });
+      list = (node?.children ?? []).map((w) => w.properties ?? {})
+        .filter((p) => p.type?.value === 'warp' && Number.isFinite(p.start?.value) && Number.isFinite(p.source_start?.value))
+        .map((p) => ({ tick: clip.start.value + p.start.value, ns: p.source_start.value, moved: p.start.value !== p.start_original?.value }))
+        .sort((x, y) => x.tick - y.tick);
+    } catch { list = []; }
+    AddOnLogic.warpCache.set(clip.id, { key, list });
+    return list;
+  },
+
+  /**
+   * A short fingerprint of the warp markers that shape the stretch `a`-`b` of a clip (`markers`
+   * from warpMarkers): those inside it and the nearest on each side. LUNA's promote_takes copies
+   * every marker of the take into the comp clip at the same place (measured on a drum kit:
+   * 724 of 724, within about 100 ticks), so a copy and its take agree until one is warped again.
+   * Places are rounded (1e8 ticks is about 20 samples) so LUNA's few ticks of difference agree.
+   */
+  warpSig(markers, a, b) {
+    const lo = a - AddOnLogic.SLACK, hi = b + AddOnLogic.SLACK;
+    let from = markers.findIndex((m) => m.tick >= lo);
+    from = from < 0 ? markers.length - 1 : Math.max(0, from - 1);
+    let to = markers.findIndex((m) => m.tick > hi);
+    if (to < 0) to = markers.length - 1;
+    const text = markers.slice(Math.max(0, from), to + 1).map((m) => `${Math.round(m.tick / 1e8)}:${Math.round(m.ns / 1e4)}`).join(',');
+    let h = 0x811c9dc5;   // FNV-1a
+    for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return `${h.toString(36)}.${text ? text.split(',').length : 0}`;
+  },
+
+  /**
+   * The warps a comp change depends on, read afresh from LUNA (before its transaction): the take
+   * clips `segments` draw on that are warped (`warped`, ids; see isWarped for the rule) and their
+   * markers (`markers`, by clip id).
+   */
+  async warpInfo(session, segments) {
+    const warped = new Set(), markers = new Map();
+    for (const id of new Set(segments.map((s) => s.take))) {
+      for (const c of session.playlists.byId(id)?.clips.items ?? []) {
+        if (c.clipType.value === 'midi') continue;
+        const list = await AddOnLogic.warpMarkers(session, c, { fresh: true });
+        if (c.renderSourceUid.value || list.some((m) => m.moved)) { warped.add(c.id); markers.set(c.id, list); }
+      }
+    }
+    return { warped, markers };
+  },
+
+  /** Whether any take on the track is warped. Stops at the first. */
+  async hasWarpedTakes(session, track) {
+    for (const take of AddOnLogic.takesOf(session, track)) {
+      await take.clips.load();
+      for (const c of take.clips.items) if (c.clipType.value !== 'midi' && await AddOnLogic.isWarped(session, c)) return true;
+    }
+    return false;
+  },
+
+  /**
+   * The file position (ns) a warped clip plays at each tick: between two markers the audio runs
+   * evenly; before the first and after the last, at its own speed. With no markers (stretched
+   * whole, as by a tempo change), evenly from the clip's start to its end. Times through the
+   * session's tempo map.
+   */
+  warpedNsAt(timeline, clip, markers) {
+    const sec = (tk) => timeline.seconds(tk);
+    const pts = (markers?.length ? markers : [{ tick: clip.start.value, ns: clip.sourceStart.value }, { tick: clip.stop.value, ns: clip.sourceStop.value }])
+      .map((m) => ({ s: sec(m.tick), ns: m.ns }));
+    const own = !!markers?.length;   // markers: past them the audio runs at its own speed
+    return (tick) => {
+      const at = sec(tick);
+      if (pts.length === 1 || at <= pts[0].s) return own || pts.length === 1 ? pts[0].ns + (at - pts[0].s) * 1e9 : pts[0].ns;
+      const last = pts[pts.length - 1];
+      if (at >= last.s) return own ? last.ns + (at - last.s) * 1e9 : last.ns;
+      let lo = 0, hi = pts.length - 1;
+      while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (pts[mid].s <= at) lo = mid; else hi = mid; }
+      const a = pts[lo], b = pts[hi], span = b.s - a.s;
+      return span > 0 ? a.ns + ((at - a.s) / span) * (b.ns - a.ns) : a.ns;
+    };
+  },
+
+  /**
+   * What to draw a clip's waveform from: `{ source, startNs, stopNs, nsAt(tick) }`, or undefined.
+   * A plain clip, its recording in a straight line (the SDK's clipAudio); a warped clip, its
+   * recording through its markers (`markers` from warpMarkers). Warped by the rule that building
+   * uses (isWarped): a rendering, or a moved marker (LUNA can drop a warped clip's rendering and
+   * keep its moved markers, seen 11/21; it renders it again to play it).
+   */
+  drawAudio(session, clip, markers) {
+    const t = session.musical.timeline;
+    if (AddOnLogic.isRendered(clip) || markers?.some((m) => m.moved)) {
+      const source = session.sources?.byId(clip.sourceUid.value);
+      if (!source) return undefined;
+      return { source, startNs: clip.sourceStart.value, stopNs: clip.sourceStop.value, nsAt: AddOnLogic.warpedNsAt(t, clip, markers), warped: true };
+    }
+    const audio = session.sources && Luna.clipAudio(clip, session.sources);
+    if (!audio) return undefined;
+    return { source: audio.source, startNs: audio.startNs, stopNs: audio.stopNs, nsAt: (tick) => Luna.audioNsAtTick(t, clip, audio, tick) };
+  },
+
+  /** Whether LUNA has a waveform for this source (false when it cannot say). */
+  async hasOverview(source) {
+    try { return !!(await source.overviewInfo()); } catch { return false; }
+  },
+
   /**
    * LUNA analyses a take's audio (for its waveform) once that take is the playlist it plays,
-   * within about a third of a second (measured on LUNA 3.1.2). Visit each take that needs it and
-   * come back, inside one continuous transaction, so the visits leave one undo step that
-   * changes nothing rather than one per take. Resolves to the sources now analysed.
+   * within about a third of a second in a small session, over a second in a big one (measured
+   * on LUNA 3.1.2). Visit each take that needs it and come back, inside one continuous
+   * transaction, so the visits leave one undo step that changes nothing rather than one per take.
+   *
+   * Nothing in the transaction may throw: LUNA 3.1.2 leaves a connection whose continuous
+   * transaction was aborted in continuous mode, each later command replacing the one before it
+   * (measured 11/23: after an abort, two playlist switches left one undo entry). That broke every
+   * later comp change (the rename undid the new SwipeComp playlist). So each visit is guarded,
+   * the tracks always go back to their playlists, and the transaction always commits.
+   *
+   * Some takes are never drawn however long they are shown (a warped take whose rendering LUNA
+   * does not analyse, seen on quantized drums), so each take is waited for at most `waitMs`,
+   * the whole pass stops after `budgetMs`, and `shouldStop()` (another track opened, or playback
+   * starting) ends it at the next check. `onProgress(n, of, lane)` before each visit. Resolves to
+   * `{ drawn, tried }`: sources now drawn, and every source asked for (not asked for again this visit).
    */
-  async analyzeTakes(session, track, missing) {
-    const done = [];
-    if (!missing.length) return done;
+  async analyzeTakes(session, track, missing, { shouldStop = () => false, onProgress, waitMs = 3000, budgetMs = 90000 } = {}) {
+    const drawn = [], tried = [];
+    const trackOf = (lane) => session.tracks.byId(lane.trackUid.value) ?? track;
+    // One visit per take, waiting for all of its files. A take its track is playing is on LUNA's
+    // Timeline already: showing it again changes nothing (LUNA draws it if it can; a warped take it
+    // never does). Such a switch is also no command to start a continuous transaction with: on
+    // Floor Tom (playing V2, undrawn) the pass ended up taking back the user's last step (11/23). So
+    // those are asked for once and never visited, and without a take to visit, or when asked to
+    // stop already, there is no transaction at all.
+    const visits = new Map();   // lane -> its sources with no waveform
+    for (const m of missing) {
+      if (session.playlistFor(trackOf(m.lane)) === m.lane) { tried.push(m.source); continue; }
+      if (!visits.has(m.lane)) visits.set(m.lane, []);
+      visits.get(m.lane).push(m.source);
+    }
+    if (!visits.size || shouldStop()) return { drawn, tried };
+    const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+    const began = Date.now();
+    const allDrawn = async (sources) => { for (const s of sources) if (!(await AddOnLogic.hasOverview(s))) return false; return true; };
     // Each lane is visited on its own track (a grouped track's takes too); every track touched
     // goes back to the playlist it was playing.
     const originals = new Map();
     await session.transaction('Draw take waveforms', async () => {
-      for (const { lane, source } of missing) {
-        const tid = lane.trackUid.value ?? track.id;
-        if (!originals.has(tid)) originals.set(tid, session.playlistFor(session.tracks.byId(tid) ?? track));
-        if (!(await source.overviewInfo())) {
-          await AddOnLogic.showPlaylist(session, tid, lane.version.value);
-          for (let i = 0; i < 30 && !(await source.overviewInfo()); i++) await new Promise((r) => setTimeout(r, 100));
-        }
-        done.push(source);
+      for (const [k, [lane, sources]] of [...visits].entries()) {
+        if (k > 0 && (shouldStop() || Date.now() - began > budgetMs)) break;   // the first visit always happens
+        tried.push(...sources);
+        try { onProgress?.(k + 1, visits.size, lane); } catch { /* drawing the progress is not the pass */ }
+        try {
+          const tid = lane.trackUid.value ?? track.id;
+          if (!originals.has(tid)) originals.set(tid, session.playlistFor(session.tracks.byId(tid) ?? track));
+          if (!(await allDrawn(sources))) {
+            await AddOnLogic.showPlaylist(session, tid, lane.version.value);
+            const until = Date.now() + waitMs;
+            while (Date.now() < until && !shouldStop() && !(await allDrawn(sources))) await pause(100);
+          }
+          for (const s of sources) if (await AddOnLogic.hasOverview(s)) drawn.push(s);
+        } catch { /* on to the next take: the transaction must still commit */ }
       }
-      for (const [tid, original] of originals) if (original) await AddOnLogic.showPlaylist(session, tid, original.version.value);
+      for (const [tid, original] of originals) {
+        const t = session.tracks.byId(tid);
+        if (!original || (t && session.playlistFor(t) === original)) continue;   // already back: no empty switch
+        try { await AddOnLogic.showPlaylist(session, tid, original.version.value); } catch { /* see below */ }
+      }
     }, { continuous: true });
-    return done;
+    // Should a switch back have failed, put the track back now (a step of its own, outside the pass).
+    for (const [tid, original] of originals) {
+      const t = session.tracks.byId(tid);
+      if (t && original && session.playlistFor(t) !== original) {
+        try { await AddOnLogic.showPlaylist(session, tid, original.version.value); } catch { /* left as it is */ }
+      }
+    }
+    return { drawn, tried };
   },
 
   /**
@@ -517,7 +710,7 @@ const AddOnLogic = {
     if (!Array.isArray(placed)) return [];
     const ours = new Map(placed.filter((p) => p.id).map((p) => [p.id, p]));
     const bySpan = placed.filter((p) => !p.id);   // MIDI comp clips: LUNA makes them, so no id is known
-    const near = (p, c) => Math.abs(p.start - c.start.value) <= 1 && Math.abs(p.stop - c.stop.value) <= 1;
+    const near = (p, c) => Math.abs(p.start - c.start.value) <= AddOnLogic.SLACK && Math.abs(p.stop - c.stop.value) <= AddOnLogic.SLACK;
     return (lane?.clips.items ?? []).filter((c) => {
       const p = ours.get(c.id);
       if (p) return !near(p, c);
@@ -552,22 +745,115 @@ const AddOnLogic = {
    * adding the old one's; measured on LUNA 3.1.2), while promote_takes keeps them where they were.
    */
   async warpedTakeClips(session, segments) {
-    const out = new Set();
-    for (const id of new Set(segments.map((s) => s.take))) {
-      for (const c of session.playlists.byId(id)?.clips.items ?? []) if (await AddOnLogic.isWarped(session, c)) out.add(c.id);
+    return (await AddOnLogic.warpInfo(session, segments)).warped;
+  },
+
+  /**
+   * The comp's clips that Swipe Comping had LUNA make from a warped take (recorded `byLuna`, or
+   * with no id by an earlier version), by id or else by span: a Map of clip to its record.
+   */
+  lunaRecords(session, track, lane) {
+    const placed = AddOnLogic.store(session).value(track.id, 'placed').value;
+    const recs = Array.isArray(placed) ? placed.filter((r) => r.byLuna || !r.id) : [];
+    const near = (r, c) => Math.abs(r.start - c.start.value) <= AddOnLogic.SLACK && Math.abs(r.stop - c.stop.value) <= AddOnLogic.SLACK;
+    const out = new Map();
+    for (const c of lane?.clips.items ?? []) {
+      const r = recs.find((x) => (x.id ? x.id === c.id : near(x, c)));
+      if (r) out.set(c, r);
+    }
+    return out;
+  },
+
+  /** The comp's clips that Swipe Comping had LUNA make from a warped take (see lunaRecords). */
+  madeByLuna(session, track, lane) {
+    return [...AddOnLogic.lunaRecords(session, track, lane).keys()];
+  },
+
+  /**
+   * For comp clips LUNA made from a warped take whose record has no fingerprint (recorded before
+   * 11/23 afternoon): the fingerprint of the warps they play now, by clip id, taken to be as they
+   * were copied. Reads LUNA (about 5 ms a clip).
+   */
+  async legacySigs(session, track, lane) {
+    const out = new Map();
+    for (const [c, r] of AddOnLogic.lunaRecords(session, track, lane)) {
+      if (r.sig !== undefined || AddOnLogic.isMidiTrack(track)) continue;
+      out.set(c.id, AddOnLogic.warpSig(await AddOnLogic.warpMarkers(session, c, { fresh: true }), r.start, r.stop));
     }
     return out;
   },
 
   /**
-   * The comp's clips that Swipe Comping had LUNA make from a warped take (recorded `byLuna`, or
-   * with no id by an earlier version), by id or else by span.
+   * What a comp change on this track needs to know about warps, read before its transaction:
+   * warpInfo for `segments`, and legacySigs. Pass it on as options to clipsReplaced or writeComp.
    */
-  madeByLuna(session, track, lane) {
+  async warpState(session, track, lane, segments) {
+    const { warped, markers } = await AddOnLogic.warpInfo(session, segments);
+    return { warped, markers, legacy: await AddOnLogic.legacySigs(session, track, lane), left: AddOnLogic.warpsLeft(session, track) };
+  },
+
+  /**
+   * Sections of the comp behind their take: the take was warped again (or first warped, or
+   * unwarped) after the section was copied, so the comp still plays the warps it was copied with.
+   * They stay so until a swipe covers them, or the user asks for them all (a
+   * swipe changes only the places it covers, and the page asks). `left` when the user chose to
+   * leave that section as it is (see warpsLeft). `[{ take, name, startTick, stopTick, key, left }]`.
+   */
+  async staleSections(session, track, lane, segments) {
     const placed = AddOnLogic.store(session).value(track.id, 'placed').value;
-    const recs = Array.isArray(placed) ? placed.filter((r) => r.byLuna || !r.id) : [];
-    const near = (r, c) => Math.abs(r.start - c.start.value) <= 1 && Math.abs(r.stop - c.stop.value) <= 1;
-    return (lane?.clips.items ?? []).filter((c) => recs.some((r) => (r.id ? r.id === c.id : near(r, c))));
+    if (!lane || !Array.isArray(placed) || AddOnLogic.isMidiTrack(track)) return [];
+    const list = AddOnLogic.merge(segments);
+    await AddOnLogic.loadTakes(session, list);
+    const { warped, markers, legacy, left } = await AddOnLogic.warpState(session, track, lane, list);
+    const pieces = AddOnLogic.plan(session, list, warped, markers), stale = [];
+    AddOnLogic.reusableClips(lane, placed, pieces, { legacy, stale });
+    return stale.map((i) => pieces[i]).map((p) => {
+      const key = AddOnLogic.leftKey(p);
+      return { take: p.take, name: p.name, startTick: p.startTick, stopTick: p.stopTick, key, left: left.has(key) };
+    });
+  },
+
+  /** A section behind its take, as the user left it: its take, place, and the take's warps then. */
+  leftKey(p) {
+    return `${p.take}|${p.startTick}|${p.stopTick}|${p.sig ?? '-'}`;
+  },
+
+  /**
+   * Sections behind their take that the user chose to leave as they are (keys from leftKey): not
+   * mentioned again until the take's warps change again. "Update them all" passes them by too;
+   * a swipe over one copies it afresh.
+   */
+  warpsLeft(session, track) {
+    const v = AddOnLogic.store(session).value(track.id, 'warpsLeft').value;
+    return new Set(Array.isArray(v) ? v.filter((k) => typeof k === 'string') : []);
+  },
+
+  /** Remember which sections behind their take to leave as they are. Not an undo step. */
+  async setWarpsLeft(session, track, keys) {
+    const store = AddOnLogic.store(session), list = [...keys].sort();
+    if (store.value(track.id, 'warpsLeft').value === undefined) await store.add(track.id, 'warpsLeft', list, { undoable: false });
+    else await store.set(track.id, 'warpsLeft', list, { undoable: false });
+  },
+
+  /** Whether a change refreshes this section behind its take: `refresh` true (all but those left), or ranges `[[a, b]]` it overlaps. */
+  refreshes(p, refresh, left) {
+    if (refresh === true) return !left?.has(AddOnLogic.leftKey(p));
+    return (refresh ?? []).some(([a, b]) => a < p.stopTick && b > p.startTick);
+  },
+
+  /** A per-track yes/no the user has given (see setFlag). */
+  flag(session, track, key) {
+    return AddOnLogic.store(session).value(track.id, key).value === true;
+  },
+
+  /**
+   * Remember a per-track answer: `warpAck`, the warp heads-up read and accepted; `compWarpsOk`,
+   * swipes may replace warps made on the comp without asking. Not an undo step.
+   */
+  async setFlag(session, track, key, on = true) {
+    const store = AddOnLogic.store(session);
+    if (store.value(track.id, key).value === undefined) await store.add(track.id, key, !!on, { undoable: false });
+    else if (store.value(track.id, key).value !== !!on) await store.set(track.id, key, !!on, { undoable: false });
   },
 
   /**
@@ -578,7 +864,7 @@ const AddOnLogic = {
   async clipMadeAt(session, lane, start, stop, known) {
     const node = await session.client.raw.get(`${lane.path}/clips`, { levels: 2 });
     const hit = (node?.children ?? []).map((c) => c.properties ?? {})
-      .find((p) => p.uid?.value && !known.has(p.uid.value) && Math.abs(p.start?.value - start) <= 1 && Math.abs(p.stop?.value - stop) <= 1);
+      .find((p) => p.uid?.value && !known.has(p.uid.value) && Math.abs(p.start?.value - start) <= AddOnLogic.SLACK && Math.abs(p.stop?.value - stop) <= AddOnLogic.SLACK);
     return hit?.uid.value;
   },
 
@@ -587,27 +873,32 @@ const AddOnLogic = {
    * that starts over (no record of the clips, or a new crossfade length) replaces them all, and
    * so does every MIDI change (a MIDI comp is rewritten whole).
    */
-  clipsReplaced(session, track, lane, segments, { fadeMs = 10, warped } = {}) {
+  clipsReplaced(session, track, lane, segments, { fadeMs = 10, warped, markers, legacy, left, refresh } = {}) {
     const all = lane?.clips.items ?? [];
     if (!all.length || AddOnLogic.isMidiTrack(track)) return [...all];
     const placed = AddOnLogic.store(session).value(track.id, 'placed').value;
     const lastFade = AddOnLogic.savedFadeMs(session, track);
     if (!Array.isArray(placed) || (lastFade !== undefined && lastFade !== fadeMs)) return [...all];
-    const kept = new Set(AddOnLogic.reusableClips(lane, placed, AddOnLogic.plan(session, AddOnLogic.merge(segments), warped)).values());
+    const kept = new Set(AddOnLogic.reusableClips(lane, placed, AddOnLogic.plan(session, AddOnLogic.merge(segments), warped, markers), { legacy, left, refresh }).values());
     return all.filter((c) => !kept.has(c));
   },
 
   /**
-   * Of the comp clips a change would replace, those warped in LUNA (their warps would be lost).
-   * Not the clips Swipe Comping had LUNA copy from a warped take: their warps are the take's, and
-   * come back with the take.
+   * Of the comp clips a change would replace, those warped on the comp itself in LUNA (their
+   * warps would be lost): a clip the page copied straight that LUNA has since warped, or one
+   * LUNA copied from a warped take whose warps no longer match the fingerprint taken as it was
+   * copied. Not a copy that still plays its take's warps: those come back with the take.
    */
   async warpedClipsReplaced(session, track, lane, segments, options = {}) {
-    const warped = await AddOnLogic.warpedTakeClips(session, segments);
-    const ours = new Set(AddOnLogic.madeByLuna(session, track, lane));
+    const state = await AddOnLogic.warpState(session, track, lane, segments);
+    const ours = AddOnLogic.lunaRecords(session, track, lane);
     const out = [];
-    for (const c of AddOnLogic.clipsReplaced(session, track, lane, segments, { ...options, warped })) {
-      if (!ours.has(c) && await AddOnLogic.isWarped(session, c)) out.push(c);
+    for (const c of AddOnLogic.clipsReplaced(session, track, lane, segments, { ...options, ...state })) {
+      const rec = ours.get(c);
+      if (rec) {
+        const was = rec.sig ?? state.legacy.get(c.id);
+        if (was !== undefined && AddOnLogic.warpSig(await AddOnLogic.warpMarkers(session, c, { fresh: true }), rec.start, rec.stop) !== was) out.push(c);
+      } else if (await AddOnLogic.isWarped(session, c)) out.push(c);
     }
     return out;
   },
@@ -755,14 +1046,21 @@ const AddOnLogic = {
    * The comp clips that can stay as they are for the new pieces: placed by the page, not moved
    * or trimmed since, from the same take, at the same place, playing the same part of the
    * recording. Map of piece index to clip. Kept clips keep whatever was done to them in LUNA
-   * (clip gain, a crossfade edited in the Timeline).
+   * (clip gain, a crossfade edited in the Timeline, a warp made on the comp).
+   *
+   * A piece is behind its take when the take's warps over it are no longer what it was copied
+   * with (its `sig` against the record's, or for a record without one, against `legacy`, what the
+   * comp clip plays now), or the take has been warped or unwarped since. A piece behind is kept as
+   * it is, old warps and all, unless `refresh` covers it (see refreshes): a swipe changes only the
+   * places it covers. Indexes of pieces behind go in `stale`; the record each
+   * kept piece was matched with, in `recs` (index to record).
    */
-  reusableClips(lane, placed, pieces) {
+  reusableClips(lane, placed, pieces, { legacy, stale, refresh, left, recs } = {}) {
     const keep = new Map(), usedRec = new Set(), usedClip = new Set();
     if (!Array.isArray(placed)) return keep;
     const items = lane?.clips.items ?? [];
     const clips = new Map(items.map((c) => [c.id, c]));
-    const near = (a0, a1, b0, b1) => Math.abs(a0 - b0) <= 1 && Math.abs(a1 - b1) <= 1;
+    const near = (a0, a1, b0, b1) => Math.abs(a0 - b0) <= AddOnLogic.SLACK && Math.abs(a1 - b1) <= AddOnLogic.SLACK;
     for (const [i, p] of pieces.entries()) {
       const rec = placed.find((r) => !usedRec.has(r) && r.take === p.take && near(r.start, r.stop, p.startTick, p.stopTick));
       if (!rec) continue;
@@ -770,10 +1068,19 @@ const AddOnLogic = {
       const c = rec.id ? clips.get(rec.id) : items.find((x) => !usedClip.has(x) && near(x.start.value, x.stop.value, rec.start, rec.stop));
       if (!c || usedClip.has(c)) continue;
       if (!near(c.start.value, c.stop.value, rec.start, rec.stop)) continue;
-      // A piece from a warped take is kept only if LUNA made it (an earlier straight copy has its
-      // warps in the wrong place); any other piece only while it still starts where it should.
-      if (p.warped ? !(rec.byLuna || !rec.id) : !(Math.abs(c.sourceStart.value - p.sourceStartNs) <= 2000)) continue;
+      // Behind its take: a piece of a warped take that LUNA did not copy (a straight copy from
+      // before the take was warped) or whose take's warps differ from those it was copied with;
+      // a piece of a plain take that LUNA copied (from when the take was warped). Kept unless
+      // refreshed. Any other plain piece is kept only while it starts where it should.
+      const byLuna = rec.byLuna || !rec.id;
+      const was = rec.sig ?? legacy?.get(c.id);
+      const behind = p.warped ? (!byLuna || (p.sig !== undefined && was !== undefined && was !== p.sig)) : byLuna;
+      if (behind) {
+        stale?.push(i);
+        if (AddOnLogic.refreshes(p, refresh, left)) continue;
+      } else if (!p.warped && !(Math.abs(c.sourceStart.value - p.sourceStartNs) <= 2000)) continue;
       keep.set(i, c);
+      recs?.set(i, rec);
       usedRec.add(rec);
       usedClip.add(c);
     }
@@ -789,7 +1096,7 @@ const AddOnLogic = {
    */
   fadeEdits(pieces, ids, fresh, before) {
     const ops = [];
-    const butted = (i) => i + 1 < pieces.length && Math.abs(pieces[i].stopTick - pieces[i + 1].startTick) <= 1;
+    const butted = (i) => i + 1 < pieces.length && Math.abs(pieces[i].stopTick - pieces[i + 1].startTick) <= 1;   // the page's own edges: exact
     const leftNow = (i) => (i > 0 && butted(i - 1) ? ids[i - 1] : null);
     const rightNow = (i) => (butted(i) ? ids[i + 1] : null);
     const dirty = (i, side) => fresh[i] || !before.has(ids[i]) || before.get(ids[i])[side] !== (side === 'left' ? leftNow(i) : rightNow(i));
@@ -831,7 +1138,7 @@ const AddOnLogic = {
     if (!Array.isArray(placed)) return out;
     for (const r of placed) {
       out.set(r.id, {
-        left: placed.find((o) => o !== r && Math.abs(o.stop - r.start) <= 1)?.id ?? null,
+        left: placed.find((o) => o !== r && Math.abs(o.stop - r.start) <= 1)?.id ?? null,   // records hold the page's own edges: exact
         right: placed.find((o) => o !== r && Math.abs(o.start - r.stop) <= 1)?.id ?? null,
       });
     }
@@ -857,9 +1164,9 @@ const AddOnLogic = {
 
   /**
    * Every LUNA group `track` is in, switched on or not, from LUNA's group list:
-   * `[{ uid, name, on, edit, trackIds }]`. `on`: switched on (in the edit context's group
-   * selection); `edit`: Edit among its attributes; `trackIds`: its other members. [] when LUNA
-   * cannot say.
+   * `[{ uid, name, on, edit, mix, trackIds }]`. `on`: switched on (in the edit context's group
+   * selection); `edit`, `mix`: Edit, Mix among its attributes (Mix links solo, among the rest);
+   * `trackIds`: its other members. [] when LUNA cannot say.
    */
   async groupsOf(session, track) {
     try {
@@ -880,11 +1187,13 @@ const AddOnLogic = {
         .map((m) => m.properties?.track_uid?.value).filter(Boolean);
       if (!ids.includes(trackId)) continue;
       const uid = g.properties?.uid?.value;
+      const attrs = String(g.properties?.group_attributes?.value ?? '').split(',').map((a) => a.trim());
       out.push({
         uid,
         name: g.properties?.name?.value ?? 'group',
         on: Array.isArray(selection) && selection.includes(uid),
-        edit: String(g.properties?.group_attributes?.value ?? '').split(',').map((a) => a.trim()).includes('edit'),
+        edit: attrs.includes('edit'),
+        mix: attrs.includes('mix'),
         trackIds: ids.filter((id) => id !== trackId),
       });
     }
@@ -908,6 +1217,14 @@ const AddOnLogic = {
     }
     const ids = [...new Set(groups.flatMap((g) => g.trackIds))];
     return ids.length ? { mode: 'ask', trackIds: ids, names: groups.filter((g) => g.trackIds.length).map((g) => g.name) } : { mode: 'none', trackIds: [], names: [] };
+  },
+
+  /**
+   * Whether LUNA links this grouped track's solo to the track being comped: a group they share is
+   * switched on with Mix among its attributes. Then soloing one solos both, in LUNA's own way.
+   */
+  soloLinked(groups, otherId) {
+    return groups.some((g) => g.on && g.mix && g.trackIds.includes(otherId));
   },
 
   /** A take's first clip (by start), or undefined for an empty take. */
@@ -980,10 +1297,10 @@ const AddOnLogic = {
    */
   async buildComp(session, track, lane, segments, options = {}) {
     await AddOnLogic.loadTakes(session, segments);
-    const warped = await AddOnLogic.warpedTakeClips(session, segments);
+    const state = await AddOnLogic.warpState(session, track, lane, segments);
     await AddOnLogic.prepareComp(session, track, lane);
     let n = 0;
-    await session.transaction('Swipe Comp', async () => { n = await AddOnLogic.writeComp(session, track, lane, segments, { ...options, warped }); });
+    await session.transaction('Swipe Comp', async () => { n = await AddOnLogic.writeComp(session, track, lane, segments, { ...options, ...state }); });
     return n;
   },
 
@@ -995,32 +1312,36 @@ const AddOnLogic = {
    */
   async buildGroupComp(session, lead, leadLane, members, segments, options = {}) {
     const all = [{ track: lead, lane: leadLane, list: segments }];
+    const making = members.filter((m) => !m.lane);
     for (const m of members) {
+      if (!m.lane) options.onStep?.(`Making a SwipeComp playlist on each grouped track (${making.indexOf(m) + 1} of ${making.length})...`);
       const lane = m.lane ?? await AddOnLogic.ensureCompLane(session, m.track);
       all.push({ track: m.track, lane, list: AddOnLogic.mapSegments(segments, m.map) });
     }
     for (const m of all) {
       await AddOnLogic.loadTakes(session, m.list);
-      m.warped = await AddOnLogic.warpedTakeClips(session, m.list);
+      m.state = await AddOnLogic.warpState(session, m.track, m.lane, m.list);
       await AddOnLogic.prepareComp(session, m.track, m.lane);
     }
     const raise = AddOnLogic.keepsOnTop(session, lead);
+    options.onStep?.('Building the comp...');
     await session.transaction('Swipe Comp', async () => {
-      for (const m of all) await AddOnLogic.writeComp(session, m.track, m.lane, m.list, { ...options, raise, warped: m.warped });
+      for (const m of all) await AddOnLogic.writeComp(session, m.track, m.lane, m.list, { ...options, raise, ...m.state });
     });
     return all.map((m) => m.lane);
   },
 
   /** The body of a comp change, inside the caller's transaction (see buildComp). */
-  async writeComp(session, track, lane, segments, { fadeMs = 10, full = false, raise, warped } = {}) {
+  async writeComp(session, track, lane, segments, { fadeMs = 10, full = false, raise, warped, markers, legacy, left, refresh } = {}) {
     const list = AddOnLogic.merge(segments);
-    const pieces = AddOnLogic.plan(session, list, warped);
+    const pieces = AddOnLogic.plan(session, list, warped, markers);
     if (AddOnLogic.isMidiTrack(track)) return AddOnLogic.writeMidiComp(session, track, lane, list, pieces, { raise });
     const store = AddOnLogic.store(session);
     const placedBefore = store.value(track.id, 'placed').value;
     const lastFade = AddOnLogic.savedFadeMs(session, track);
     const whole = full || !Array.isArray(placedBefore) || (lastFade !== undefined && lastFade !== fadeMs);
-    const keep = whole ? new Map() : AddOnLogic.reusableClips(lane, placedBefore, pieces);
+    const keptRecs = new Map();
+    const keep = whole ? new Map() : AddOnLogic.reusableClips(lane, placedBefore, pieces, { legacy, left, refresh, recs: keptRecs });
     const before = AddOnLogic.neighboursOf(placedBefore);
     {
       // Keep SwipeComp at the top of LUNA's list, unless the user chose to leave it where it is.
@@ -1052,9 +1373,14 @@ const AddOnLogic = {
         ids.push(clip?.id);
         if (clip?.id) known.add(clip.id);
         fresh.push(!keep.has(i));
-        // A piece from a warped take is recorded as LUNA's (`byLuna`), kept or new: its warps are the
-        // take's (see madeByLuna). Should LUNA not show its clip, it is recorded by span alone.
-        if (placed && p.warped) placed.push({ id: clip?.id ?? null, start: p.startTick, stop: p.stopTick, take: p.take, byLuna: true });
+        // A piece LUNA copied from a warped take is recorded as LUNA's (`byLuna`): its warps are the
+        // take's (see madeByLuna), with their fingerprint as copied (`sig`). A kept piece keeps its
+        // record's kind and fingerprint (one behind its take still plays what it was copied with).
+        // Should LUNA not show its clip, it is recorded by span alone.
+        const prev = keptRecs.get(i);
+        const lunaMade = prev ? (prev.byLuna || !prev.id) : p.warped;
+        const sig = prev ? (prev.sig ?? legacy?.get(clip?.id)) : p.sig;
+        if (placed && lunaMade) placed.push({ id: clip?.id ?? null, start: p.startTick, stop: p.stopTick, take: p.take, byLuna: true, ...(sig !== undefined ? { sig } : {}) });
         else if (placed && clip?.id) placed.push({ id: clip.id, start: p.startTick, stop: p.stopTick, take: p.take });
         else placed = null;   // no record rather than a wrong one
       }
